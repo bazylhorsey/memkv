@@ -1,0 +1,4 @@
+comment = 'In-memory key-value store with TTLs'
+default_version = '0.1'
+module_pathname = '$libdir/memkv'
+relocatable = true
