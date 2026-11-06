@@ -112,6 +112,7 @@ typedef struct KVShared
     uint64      hash_seed;          /* random, so nobody can craft collisions */
     dshash_table_handle index_handle;   /* the index, which lives in kv_dsa */
     int         index_tranche;      /* its LWLock tranche */
+    LWLock      reclaim_lock;       /* one backend at a time frees memory */
 } KVShared;
 
 /* An eviction candidate, copied out of the index during a scan. */
@@ -225,6 +226,8 @@ kv_shared_init(void *ptr, void *arg)
     if (!pg_strong_random(&s->hash_seed, sizeof(s->hash_seed)))
         s->hash_seed = (uint64) GetCurrentTimestamp() ^
             ((uint64) MyProcPid << 32);
+
+    LWLockInitialize(&s->reclaim_lock, LWLockNewTrancheId("memkv_reclaim"));
 
     s->index_tranche = LWLockNewTrancheId("memkv_index");
     params.tranche_id = s->index_tranche;
@@ -621,16 +624,30 @@ kv_alloc(Size len)
                  errmsg("memkv entry of %zu bytes does not fit in memkv.max_memory",
                         len)));
 
-    for (;;)
-    {
-        p = dsa_allocate_extended(kv_dsa, Max(len, 1), DSA_ALLOC_NO_OOM);
-        if (DsaPointerIsValid(p) || !kv_reclaim(&rc))
-            break;
-    }
-
-    kv_reclaim_done(&rc);
+    p = dsa_allocate_extended(kv_dsa, Max(len, 1), DSA_ALLOC_NO_OOM);
     if (!DsaPointerIsValid(p))
-        kv_full_error();
+    {
+        /*
+         * No room. Make some, one backend at a time. If every backend that
+         * failed scanned the index at once they would all pick the same oldest
+         * keys: one would evict them, and the rest would find nothing to evict,
+         * give up and raise an error while the winner's memory sat free. So
+         * whoever gets the lock first tries again, because someone else may
+         * have freed what it needs while it waited, and only then evicts.
+         */
+        LWLockAcquire(&kv_shared->reclaim_lock, LW_EXCLUSIVE);
+        for (;;)
+        {
+            p = dsa_allocate_extended(kv_dsa, Max(len, 1), DSA_ALLOC_NO_OOM);
+            if (DsaPointerIsValid(p) || !kv_reclaim(&rc))
+                break;
+        }
+        LWLockRelease(&kv_shared->reclaim_lock);
+
+        kv_reclaim_done(&rc);
+        if (!DsaPointerIsValid(p))
+            kv_full_error();
+    }
     return p;
 }
 
@@ -671,18 +688,28 @@ kv_insert(const KVKey *key, dsa_pointer newval, bool *found)
     KVReclaim   rc = {0};
     KVEntry    *e;
 
-    while ((e = dshash_find_or_insert_extended(kv_hash, &key->hash, found,
-                                               DSHASH_INSERT_NO_OOM)) == NULL)
+    e = dshash_find_or_insert_extended(kv_hash, &key->hash, found,
+                                       DSHASH_INSERT_NO_OOM);
+    if (e == NULL)
     {
-        if (!kv_reclaim(&rc))
+        /* No room in the index: reclaim one backend at a time, as in kv_alloc. */
+        LWLockAcquire(&kv_shared->reclaim_lock, LW_EXCLUSIVE);
+        while ((e = dshash_find_or_insert_extended(kv_hash, &key->hash, found,
+                                                   DSHASH_INSERT_NO_OOM)) == NULL)
         {
-            kv_reclaim_done(&rc);
+            if (!kv_reclaim(&rc))
+                break;
+        }
+        LWLockRelease(&kv_shared->reclaim_lock);
+
+        kv_reclaim_done(&rc);
+        if (e == NULL)
+        {
             if (DsaPointerIsValid(newval))
                 dsa_free(kv_dsa, newval);
             kv_full_error();
         }
     }
-    kv_reclaim_done(&rc);
 
     if (*found && !kv_entry_is(e, key))
     {

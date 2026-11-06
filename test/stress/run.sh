@@ -149,6 +149,26 @@ else
     bad "mixed: eviction=$evicted expiry=$expired, so a path was never exercised"
 fi
 
+# --- 4b. the index is most of the memory ------------------------------------
+# One-byte values over millions of keys: what is stored is mostly index, and it
+# has to grow and evict inside the cap without ever failing.
+$PSQL -c "SELECT kv_flush()" >/dev/null
+mark=$(log_mark)
+if pgb "tiny keys" -c "$CLIENTS" -T 10 -f tiny.sql; then
+    ok "tiny keys: $CLIENTS clients, 10s of 1-byte values over 5 million keys, no errors"
+fi
+log_check "$mark" "tiny keys"
+$PSQL -F' ' -c "SELECT 'stats after tiny keys: keys=' || keys || ' bytes=' || memory_bytes || '/' || max_memory_bytes || ' evicted=' || evicted FROM kv_stats()"
+
+# The same, but starting from a store full of big values: the index has to grow
+# while there is no free memory, by evicting.
+fill_capacity >/dev/null
+mark=$(log_mark)
+if pgb "tiny after big" -c "$CLIENTS" -T 10 -f tiny.sql; then
+    ok "tiny after big: the index grew inside a full cap without errors"
+fi
+log_check "$mark" "tiny after big"
+
 # --- 5. leak check ----------------------------------------------------------
 # Run the mixed workload again and again, flush after each run, and count how
 # many 1000-byte values fit. The index bucket array only ever grows, and where
