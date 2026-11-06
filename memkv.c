@@ -1450,8 +1450,17 @@ kv_sweep(PG_FUNCTION_ARGS)
 Datum
 kv_flush(PG_FUNCTION_ARGS)
 {
+    int64       n;
+
     kv_attach();
-    PG_RETURN_INT64(kv_purge(false));
+    n = kv_purge(false);
+
+    /*
+     * The DSA keeps one empty superblock per value-size class it has ever
+     * used; give those back so a flushed store has its whole cap again.
+     */
+    dsa_trim(kv_dsa);
+    PG_RETURN_INT64(n);
 }
 
 /*
