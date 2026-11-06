@@ -1,7 +1,7 @@
 # memkv
 
 A Valkey-style key-value store with TTLs and LRU eviction, kept in PostgreSQL
-shared memory. Requires PostgreSQL 19+ (`GetNamedDSA` / `GetNamedDSHash`).
+shared memory. Requires PostgreSQL 19+ (`GetNamedDSA`).
 
 ## Build and try it
 
@@ -61,7 +61,7 @@ optimistic: concurrent writers to the same hash retry rather than block.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `memkv.max_memory` | `64MB` | Approximate cap on value storage. |
+| `memkv.max_memory` | `64MB` | Cap on the shared memory memkv uses: keys, values and the index. |
 | `memkv.eviction_policy` | `allkeys-lru` | What happens when the cap is reached: `allkeys-lru`, `volatile-lru` (only keys with a TTL), or `noeviction` (error). |
 
 Both are `SIGHUP` settings: change them with `ALTER SYSTEM` and
@@ -100,9 +100,13 @@ or nothing evictable is left (then it errors with `memkv is full`).
   share the server.
 - **Not durable:** Data is gone when Postgres restarts or crashes, and
   replicas never see it.
-- **Memory:** `memkv.max_memory` caps value storage only. Each key also
-  costs about 200 bytes of index, which is not capped, and keys can be at
-  most 127 bytes.
+- **Memory:** `memkv.max_memory` caps everything memkv stores: keys, values
+  and the index. A key costs about 90 bytes of index plus its own bytes and
+  its value, each rounded up to the allocator's size class. Keys can be any
+  length. The allocator keeps one 64 KB block per value-size class it has
+  used, so with many different sizes up to about 2.3 MB of the cap can sit
+  reserved; that only matters for caps under about 16 MB. A full index is
+  handled like full value space: expired keys go first, then eviction.
 - **Docker:** Set `--shm-size` above `max_memory`. This memory lives in
   `/dev/shm`, which defaults to 64MB in Docker.
 

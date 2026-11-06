@@ -13,18 +13,17 @@ extern void *GetNamedDSMSegment(const char *name, size_t size,
                                 void (*init_callback) (void *ptr, void *arg),
                                 bool *found, void *arg);
 extern dsa_area *GetNamedDSA(const char *name, bool *found);
-extern dshash_table *GetNamedDSHash(const char *name,
-                                    const dshash_parameters *params,
-                                    bool *found);
 
 #define DSHASH_INSERT_NO_OOM 0x01
 extern void *dshash_find_or_insert_extended(dshash_table *hash_table,
                                             const void *key, bool *found,
                                             int flags);
-extern int dshash_strcmp(const void *a, const void *b, size_t size, void *arg);
-extern dshash_hash dshash_strhash(const void *v, size_t size, void *arg);
-extern void dshash_strcpy(void *dest, const void *src, size_t size, void *arg);
 extern size_t dsa_get_total_size(dsa_area *area);
+
+/* PG 19 names its LWLock tranches; older releases take no argument. */
+#if PG_VERSION_NUM < 190000
+#define LWLockNewTrancheId(name) LWLockNewTrancheId()
+#endif
 
 #ifndef INTERVAL_NOEND
 #define INTERVAL_NOEND(i) \

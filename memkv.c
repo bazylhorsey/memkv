@@ -1,12 +1,18 @@
 /*
  * memkv.c - Valkey-style key-value store in PostgreSQL shared memory.
- * Requires PostgreSQL 19+ (GetNamedDSA / GetNamedDSHash).
+ * Requires PostgreSQL 19+ (GetNamedDSA / GetNamedDSMSegment with an arg).
  *
  * Copyright (c) 2026, Bazyl Horsey. PostgreSQL License; see LICENSE.
  *
- * Keys hold either a string or a hash (field -> value map). When the value
- * store is full, memkv drops expired keys first and then evicts
- * least-recently-used keys (see memkv.eviction_policy).
+ * Keys hold either a string or a hash (field -> value map). When the store is
+ * full, memkv drops expired keys first and then evicts least-recently-used
+ * keys (see memkv.eviction_policy).
+ *
+ * Everything lives in one DSA, so memkv.max_memory caps all of it. The index
+ * is a dshash table keyed by a 128-bit hash of the key, and each entry points
+ * at one allocation holding the key bytes followed by the value bytes. The
+ * full key is compared on every lookup, so a hash collision can never return
+ * or overwrite another key's value.
  */
 #include "postgres.h"
 
@@ -14,6 +20,7 @@
 
 #include "access/htup_details.h"
 #include "catalog/pg_type.h"
+#include "common/hashfn.h"
 #include "common/int.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -22,6 +29,7 @@
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/dsm_registry.h"
+#include "storage/lwlock.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/dsa.h"
@@ -31,7 +39,6 @@
 
 PG_MODULE_MAGIC;
 
-#define KV_KEY_LEN  128             /* max key bytes incl. NUL */
 #define KV_NEVER    PG_INT64_MAX    /* expires_at for keys with no TTL */
 #define KV_INT_BUF  32              /* room for any int64 as text */
 
@@ -65,18 +72,36 @@ typedef enum KVType
     KV_HASH = 1
 } KVType;
 
+/*
+ * The index key: a 128-bit hash of the key bytes, seeded per store. The full
+ * key is kept next to the value and compared on every lookup.
+ */
+typedef struct KVHash
+{
+    uint64      w[2];
+} KVHash;
+
+/* A key as the caller gave it, plus its hash. The bytes belong to the caller. */
+typedef struct KVKey
+{
+    KVHash      hash;
+    const char *data;
+    Size        len;
+} KVKey;
+
 typedef struct KVEntry
 {
-    char        key[KV_KEY_LEN];    /* hash key: must be first */
-    dsa_pointer value;              /* value bytes, in kv_dsa */
-    Size        len;
+    KVHash      hash;               /* hash key: must be first */
+    dsa_pointer data;               /* key bytes, then value bytes, in kv_dsa */
+    uint32      klen;               /* length of the key at the start of data */
+    uint8       type;               /* KVType */
+    Size        len;                /* length of the value after the key */
     TimestampTz expires_at;
     uint64      version;            /* changes whenever value changes */
     pg_atomic_uint64 atime;         /* last access; written under a shared lock */
-    uint8       type;               /* KVType */
 } KVEntry;
 
-/* Server-wide counters, in a small named DSM segment. */
+/* Server-wide state, in a small named DSM segment. */
 typedef struct KVShared
 {
     pg_atomic_uint64 hits;
@@ -84,30 +109,46 @@ typedef struct KVShared
     pg_atomic_uint64 evicted;
     pg_atomic_uint64 expired;
     pg_atomic_uint64 version;       /* source of KVEntry.version */
+    uint64      hash_seed;          /* random, so nobody can craft collisions */
+    dshash_table_handle index_handle;   /* the index, which lives in kv_dsa */
+    int         index_tranche;      /* its LWLock tranche */
 } KVShared;
 
 /* An eviction candidate, copied out of the index during a scan. */
 typedef struct KVCandidate
 {
     TimestampTz atime;
-    char        key[KV_KEY_LEN];
+    KVHash      hash;
 } KVCandidate;
 
+/* The key is already a good hash, so some of its bits will do for dshash. */
+static dshash_hash
+kv_dshash_hash(const void *v, size_t size, void *arg)
+{
+    uint32      h;
+
+    memcpy(&h, v, sizeof(h));
+    return h;
+}
+
 static const dshash_parameters kv_params = {
-    .key_size = KV_KEY_LEN,
+    .key_size = sizeof(KVHash),
     .entry_size = sizeof(KVEntry),
-    .compare_function = dshash_strcmp,
-    .hash_function = dshash_strhash,
-    .copy_function = dshash_strcpy,
-    /* tranche_id is assigned by GetNamedDSHash() */
+    .compare_function = dshash_memcmp,
+    .hash_function = kv_dshash_hash,
+    .copy_function = dshash_memcpy,
+    /* tranche_id comes from KVShared.index_tranche */
 };
 
-static dsa_area *kv_dsa = NULL;         /* value storage */
+static dsa_area *kv_dsa = NULL;         /* keys, values and the index */
 static dshash_table *kv_hash = NULL;    /* key index */
-static KVShared *kv_shared = NULL;      /* counters */
+static KVShared *kv_shared = NULL;      /* counters, seed, index handle */
 static int  kv_max_memory_mb = 64;
 static int  kv_eviction_policy = KV_EVICT_ALLKEYS_LRU;
 static int  kv_applied_mb = -1;
+#ifdef USE_ASSERT_CHECKING
+static bool kv_test_weak_hash = false;  /* test only: see _PG_init */
+#endif
 
 PG_FUNCTION_INFO_V1(kv_set);
 PG_FUNCTION_INFO_V1(kv_get);
@@ -133,7 +174,7 @@ void
 _PG_init(void)
 {
     DefineCustomIntVariable("memkv.max_memory",
-                            "Approximate cap on shared memory for memkv values.",
+                            "Cap on the shared memory memkv uses for keys, values and index.",
                             NULL, &kv_max_memory_mb,
                             64, 1, INT_MAX,
                             PGC_SIGHUP, GUC_UNIT_MB,
@@ -147,19 +188,48 @@ _PG_init(void)
                              KV_EVICT_ALLKEYS_LRU, kv_eviction_options,
                              PGC_SIGHUP, 0,
                              NULL, NULL, NULL);
+#ifdef USE_ASSERT_CHECKING
+    /*
+     * Cut every key hash to one bit so that keys collide, to test collision
+     * handling. Only exists in assertion builds. Flush the store before and
+     * after changing it: entries made under another hash can't be found.
+     */
+    DefineCustomBoolVariable("memkv.test_weak_hash",
+                             "Test only: keep one bit of each key hash.",
+                             NULL, &kv_test_weak_hash, false,
+                             PGC_SIGHUP, GUC_NOT_IN_SAMPLE,
+                             NULL, NULL, NULL);
+#endif
     MarkGUCPrefixReserved("memkv");
 }
 
+/*
+ * Runs once, in the first backend to use the store, while it holds the DSM
+ * registry entry. 'arg' is the values DSA, which the caller attached first:
+ * calling GetNamedDSA() from here would re-enter the registry.
+ *
+ * The index is made inside that DSA, so memkv.max_memory covers it too.
+ */
 static void
 kv_shared_init(void *ptr, void *arg)
 {
     KVShared   *s = (KVShared *) ptr;
+    dshash_parameters params = kv_params;
 
     pg_atomic_init_u64(&s->hits, 0);
     pg_atomic_init_u64(&s->misses, 0);
     pg_atomic_init_u64(&s->evicted, 0);
     pg_atomic_init_u64(&s->expired, 0);
     pg_atomic_init_u64(&s->version, 0);
+
+    if (!pg_strong_random(&s->hash_seed, sizeof(s->hash_seed)))
+        s->hash_seed = (uint64) GetCurrentTimestamp() ^
+            ((uint64) MyProcPid << 32);
+
+    s->index_tranche = LWLockNewTrancheId("memkv_index");
+    params.tranche_id = s->index_tranche;
+    kv_hash = dshash_create((dsa_area *) arg, &params, NULL);
+    s->index_handle = dshash_get_hash_table_handle(kv_hash);
 }
 
 /* Attach to the shared store; the first caller on the server creates it. */
@@ -168,13 +238,21 @@ kv_attach(void)
 {
     bool        found;
 
-    if (kv_shared == NULL)
-        kv_shared = GetNamedDSMSegment("memkv_shared", sizeof(KVShared),
-                                       kv_shared_init, &found, NULL);
     if (kv_dsa == NULL)
         kv_dsa = GetNamedDSA("memkv_values", &found);
+    if (kv_shared == NULL)
+        kv_shared = GetNamedDSMSegment("memkv_shared", sizeof(KVShared),
+                                       kv_shared_init, &found, kv_dsa);
     if (kv_hash == NULL)
-        kv_hash = GetNamedDSHash("memkv_index", &kv_params, &found);
+    {
+        /* not the creator: attach, keeping the local state for good */
+        dshash_parameters params = kv_params;
+        MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+
+        params.tranche_id = kv_shared->index_tranche;
+        kv_hash = dshash_attach(kv_dsa, &params, kv_shared->index_handle, NULL);
+        MemoryContextSwitchTo(oldcontext);
+    }
 
     if (kv_applied_mb != kv_max_memory_mb)
     {
@@ -223,21 +301,70 @@ kv_wrongtype(void)
              errmsg("memkv key holds the wrong kind of value")));
 }
 
+/*
+ * Make a KVKey from the bytes of t, which must stay alive as long as the key
+ * is used. Attaches to the store first, because the hash needs its seed.
+ * Two seeded 64-bit hashes make the 128 bits.
+ */
 static void
-kv_key_bytes(const char *data, Size len, char *buf)
+kv_key(text *t, KVKey *k)
 {
-    if (len >= KV_KEY_LEN)
-        ereport(ERROR,
-                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                 errmsg("memkv keys can be at most %d bytes", KV_KEY_LEN - 1)));
-    memcpy(buf, data, len);
-    buf[len] = '\0';
+    uint64      seed;
+
+    kv_attach();
+    seed = kv_shared->hash_seed;
+    k->data = VARDATA_ANY(t);
+    k->len = VARSIZE_ANY_EXHDR(t);
+    k->hash.w[0] = hash_bytes_extended((const unsigned char *) k->data,
+                                       (int) k->len, seed);
+    k->hash.w[1] = hash_bytes_extended((const unsigned char *) k->data,
+                                       (int) k->len,
+                                       seed ^ UINT64CONST(0x9e3779b97f4a7c15));
+#ifdef USE_ASSERT_CHECKING
+    if (kv_test_weak_hash)
+    {
+        k->hash.w[0] &= 1;
+        k->hash.w[1] = 0;
+    }
+#endif
 }
 
-static void
-kv_key(text *t, char *buf)
+/* Where an entry's key bytes are; its value follows them. */
+static inline char *
+kv_entry_base(const KVEntry *e)
 {
-    kv_key_bytes(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), buf);
+    return (char *) dsa_get_address(kv_dsa, e->data);
+}
+
+static inline char *
+kv_entry_value(const KVEntry *e)
+{
+    return kv_entry_base(e) + e->klen;
+}
+
+/* Is this entry for this key, as opposed to another key with the same hash? */
+static inline bool
+kv_entry_is(const KVEntry *e, const KVKey *key)
+{
+    return e->klen == key->len &&
+        memcmp(kv_entry_base(e), key->data, key->len) == 0;
+}
+
+/*
+ * Look the key up and lock its entry; NULL if there is none. An entry with
+ * the same hash but a different key isn't ours, so it counts as missing.
+ */
+static KVEntry *
+kv_find(const KVKey *key, bool exclusive)
+{
+    KVEntry    *e = dshash_find(kv_hash, &key->hash, exclusive);
+
+    if (e != NULL && !kv_entry_is(e, key))
+    {
+        dshash_release_lock(kv_hash, e);
+        return NULL;
+    }
+    return e;
 }
 
 static TimestampTz
@@ -269,7 +396,7 @@ kv_purge(bool only_expired)
     {
         if (only_expired && !kv_expired(e, now))
             continue;
-        dsa_free(kv_dsa, e->value);
+        dsa_free(kv_dsa, e->data);
         dshash_delete_current(&status);
         n++;
     }
@@ -326,7 +453,7 @@ kv_pool_offer(KVCandidate *pool, int *n, int cap, const KVEntry *e,
     {
         /* replace the youngest candidate */
         pool[0].atime = atime;
-        strlcpy(pool[0].key, e->key, KV_KEY_LEN);
+        pool[0].hash = e->hash;
         kv_pool_sift_down(pool, *n, 0);
         return;
     }
@@ -334,7 +461,7 @@ kv_pool_offer(KVCandidate *pool, int *n, int cap, const KVEntry *e,
         return;
 
     pool[i].atime = atime;
-    strlcpy(pool[i].key, e->key, KV_KEY_LEN);
+    pool[i].hash = e->hash;
 }
 
 static int
@@ -374,7 +501,7 @@ kv_evict_round(KVCandidate *pool, int round, int *ncand)
     {
         if (kv_expired(e, now))
         {
-            dsa_free(kv_dsa, e->value);
+            dsa_free(kv_dsa, e->data);
             dshash_delete_current(&status);
             expired++;
             continue;
@@ -400,7 +527,7 @@ kv_evict_round(KVCandidate *pool, int round, int *ncand)
     {
         dsa_pointer val;
 
-        e = dshash_find(kv_hash, pool[i].key, true);
+        e = dshash_find(kv_hash, &pool[i].hash, true);
         if (e == NULL)
             continue;                   /* deleted meanwhile */
         if (kv_atime(e) != pool[i].atime)
@@ -409,7 +536,7 @@ kv_evict_round(KVCandidate *pool, int round, int *ncand)
             dshash_release_lock(kv_hash, e);
             continue;
         }
-        val = e->value;
+        val = e->data;
         dshash_delete_entry(kv_hash, e);    /* also releases the lock */
         dsa_free(kv_dsa, val);
         evicted++;
@@ -418,107 +545,176 @@ kv_evict_round(KVCandidate *pool, int round, int *ncand)
     return evicted;
 }
 
+/* State for a loop that frees memory until an allocation fits. */
+typedef struct KVReclaim
+{
+    KVCandidate *pool;
+    int         round;
+    int         stalls;
+} KVReclaim;
+
+static pg_noreturn void
+kv_full_error(void)
+{
+    ereport(ERROR,
+            (errcode(ERRCODE_OUT_OF_MEMORY),
+             errmsg("memkv is full"),
+             kv_eviction_policy == KV_EVICT_VOLATILE_LRU ?
+             errhint("No keys with a TTL are left to evict. Add TTLs, "
+                     "delete keys, or raise memkv.max_memory.") :
+             errhint("Delete keys, add TTLs, or raise memkv.max_memory.")));
+}
+
 /*
- * Allocate value space. Never call while holding a dshash lock: when the
- * store is full this sweeps expired keys and evicts others, which takes
- * those locks.
+ * Free some memory: drop expired keys, then evict as the policy allows.
+ * Returns false when there is nothing more to free. Never call while holding
+ * a dshash lock: this takes them.
+ */
+static bool
+kv_reclaim(KVReclaim *rc)
+{
+    int64       freed;
+    int         ncand;
+
+    CHECK_FOR_INTERRUPTS();
+
+    if (kv_eviction_policy == KV_EVICT_NONE)
+    {
+        /* Drop expired keys once, then give up. */
+        return rc->round++ == 0 && kv_purge(true) > 0;
+    }
+
+    if (rc->pool == NULL)
+        rc->pool = palloc(sizeof(KVCandidate) * KV_EVICT_MAX);
+    freed = kv_evict_round(rc->pool, rc->round++, &ncand);
+    if (freed > 0)
+        rc->stalls = 0;
+    else if (ncand == 0 || ++rc->stalls >= KV_EVICT_STALLS)
+        return false;                   /* nothing left we may evict */
+    return true;
+}
+
+static void
+kv_reclaim_done(KVReclaim *rc)
+{
+    if (rc->pool != NULL)
+        pfree(rc->pool);
+    rc->pool = NULL;
+}
+
+/*
+ * Allocate space for a key and value. Never call while holding a dshash
+ * lock: when the store is full this sweeps expired keys and evicts others,
+ * which takes those locks.
  */
 static dsa_pointer
 kv_alloc(Size len)
 {
     Size        limit = (Size) kv_max_memory_mb * 1024 * 1024;
-    KVCandidate *pool = NULL;
+    KVReclaim   rc = {0};
     dsa_pointer p;
-    int         round = 0;
-    int         stalls = 0;
 
-    /* Don't wipe the store for a value that could never fit. */
+    /* Don't wipe the store for an entry that could never fit. */
     if (len >= limit)
         ereport(ERROR,
                 (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                 errmsg("memkv value of %zu bytes does not fit in memkv.max_memory",
+                 errmsg("memkv entry of %zu bytes does not fit in memkv.max_memory",
                         len)));
 
     for (;;)
     {
-        int64       freed;
-        int         ncand;
-
         p = dsa_allocate_extended(kv_dsa, Max(len, 1), DSA_ALLOC_NO_OOM);
-        if (DsaPointerIsValid(p))
+        if (DsaPointerIsValid(p) || !kv_reclaim(&rc))
             break;
-
-        CHECK_FOR_INTERRUPTS();
-
-        if (kv_eviction_policy == KV_EVICT_NONE)
-        {
-            /* Old behaviour: drop expired keys once, then give up. */
-            if (round++ > 0 || kv_purge(true) == 0)
-                break;
-            continue;
-        }
-
-        if (pool == NULL)
-            pool = palloc(sizeof(KVCandidate) * KV_EVICT_MAX);
-        freed = kv_evict_round(pool, round++, &ncand);
-        if (freed > 0)
-            stalls = 0;
-        else if (ncand == 0 || ++stalls >= KV_EVICT_STALLS)
-            break;                      /* nothing left we may evict */
     }
 
-    if (pool != NULL)
-        pfree(pool);
+    kv_reclaim_done(&rc);
     if (!DsaPointerIsValid(p))
-        ereport(ERROR,
-                (errcode(ERRCODE_OUT_OF_MEMORY),
-                 errmsg("memkv is full"),
-                 kv_eviction_policy == KV_EVICT_VOLATILE_LRU ?
-                 errhint("No keys with a TTL are left to evict. Add TTLs, "
-                         "delete keys, or raise memkv.max_memory.") :
-                 errhint("Delete keys, add TTLs, or raise memkv.max_memory.")));
+        kv_full_error();
     return p;
 }
 
-/* Copy bytes into a fresh value allocation (no lock may be held). */
+/* Allocate room for the key (copied in) followed by vlen bytes of value. */
 static dsa_pointer
-kv_alloc_copy(const char *data, Size len)
+kv_alloc_blob(const KVKey *key, Size vlen)
 {
-    dsa_pointer p = kv_alloc(len);
+    dsa_pointer p = kv_alloc(key->len + vlen);
 
-    memcpy(dsa_get_address(kv_dsa, p), data, len);
+    memcpy(dsa_get_address(kv_dsa, p), key->data, key->len);
+    return p;
+}
+
+/* Allocate an entry's key and value and fill them in (no lock may be held). */
+static dsa_pointer
+kv_alloc_copy(const KVKey *key, const char *data, Size len)
+{
+    dsa_pointer p = kv_alloc_blob(key, len);
+
+    memcpy((char *) dsa_get_address(kv_dsa, p) + key->len, data, len);
     return p;
 }
 
 /*
- * Find or insert a key with an exclusive lock, without erroring while we own
- * an unattached value: if the index can't grow, free newval and then error.
+ * Find or insert the entry for a key, exclusively locked. newval, if valid,
+ * is an allocation we own that isn't attached yet; every error path frees it.
+ *
+ * If the index has no room, make some the way kv_alloc does for values.
+ * Under the cap that covers a full table and a bucket array that can't grow;
+ * with DSHASH_INSERT_NO_OOM both come back as NULL instead of an error.
+ *
+ * Another live key with the same hash can't share the entry: that is an
+ * error. If it has expired, we take its entry over and report it as new.
  */
 static KVEntry *
-kv_insert(const char *key, dsa_pointer newval, bool *found)
+kv_insert(const KVKey *key, dsa_pointer newval, bool *found)
 {
-    KVEntry    *e = dshash_find_or_insert_extended(kv_hash, key, found,
-                                                   DSHASH_INSERT_NO_OOM);
+    KVReclaim   rc = {0};
+    KVEntry    *e;
 
-    if (e == NULL)
+    while ((e = dshash_find_or_insert_extended(kv_hash, &key->hash, found,
+                                               DSHASH_INSERT_NO_OOM)) == NULL)
     {
-        if (DsaPointerIsValid(newval))
-            dsa_free(kv_dsa, newval);
-        ereport(ERROR,
-                (errcode(ERRCODE_OUT_OF_MEMORY),
-                 errmsg("out of memory for the memkv index")));
+        if (!kv_reclaim(&rc))
+        {
+            kv_reclaim_done(&rc);
+            if (DsaPointerIsValid(newval))
+                dsa_free(kv_dsa, newval);
+            kv_full_error();
+        }
+    }
+    kv_reclaim_done(&rc);
+
+    if (*found && !kv_entry_is(e, key))
+    {
+        if (!kv_expired(e, GetCurrentTimestamp()))
+        {
+            dshash_release_lock(kv_hash, e);
+            if (DsaPointerIsValid(newval))
+                dsa_free(kv_dsa, newval);
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("memkv key hash collision"),
+                     errhint("Another key has the same 128-bit hash. "
+                             "Use a different key.")));
+        }
+        dsa_free(kv_dsa, e->data);
+        e->data = InvalidDsaPointer;
+        e->klen = 0;
+        kv_count(&kv_shared->expired, 1);
+        *found = false;
     }
     return e;
 }
 
-/* Point a locked entry at a new value. Returns the old value to free. */
+/* Point a locked entry at a new allocation. Returns the old one to free. */
 static dsa_pointer
-kv_store(KVEntry *e, bool found, dsa_pointer newval, Size len, KVType type,
-         TimestampTz now)
+kv_store(KVEntry *e, bool found, dsa_pointer newval, const KVKey *key,
+         Size len, KVType type, TimestampTz now)
 {
-    dsa_pointer oldval = found ? e->value : InvalidDsaPointer;
+    dsa_pointer oldval = found ? e->data : InvalidDsaPointer;
 
-    e->value = newval;
+    e->data = newval;
+    e->klen = (uint32) key->len;
     e->len = len;
     e->type = (uint8) type;
     e->version = kv_next_version();
@@ -528,9 +724,9 @@ kv_store(KVEntry *e, bool found, dsa_pointer newval, Size len, KVType type,
 
 /* Remove a key seen as expired, re-checking under an exclusive lock. */
 static void
-kv_remove_expired(const char *key)
+kv_remove_expired(const KVKey *key)
 {
-    KVEntry    *e = dshash_find(kv_hash, key, true);
+    KVEntry    *e = kv_find(key, true);
     dsa_pointer val;
 
     if (e == NULL)
@@ -540,7 +736,7 @@ kv_remove_expired(const char *key)
         dshash_release_lock(kv_hash, e);
         return;
     }
-    val = e->value;
+    val = e->data;
     dshash_delete_entry(kv_hash, e);    /* also releases the lock */
     dsa_free(kv_dsa, val);
     kv_count(&kv_shared->expired, 1);
@@ -589,7 +785,7 @@ typedef enum KVSetCond
 
 /* Set one string key. Returns false if cond stopped the write. */
 static bool
-kv_set_one(const char *key, const char *data, Size len,
+kv_set_one(const KVKey *key, const char *data, Size len,
            TimestampTz expires_at, KVSetCond cond)
 {
     dsa_pointer newval;
@@ -598,13 +794,13 @@ kv_set_one(const char *key, const char *data, Size len,
     bool        found;
     TimestampTz now;
 
-    /* Copy the value into shared memory before taking any lock. */
-    newval = kv_alloc_copy(data, len);
+    /* Copy the key and value into shared memory before taking any lock. */
+    newval = kv_alloc_copy(key, data, len);
     now = GetCurrentTimestamp();
 
     if (cond == KV_SET_XX)
     {
-        e = dshash_find(kv_hash, key, true);
+        e = kv_find(key, true);
         found = (e != NULL);
         if (!found || kv_expired(e, now))
         {
@@ -625,7 +821,7 @@ kv_set_one(const char *key, const char *data, Size len,
         }
     }
 
-    oldval = kv_store(e, found, newval, len, KV_STRING, now);
+    oldval = kv_store(e, found, newval, key, len, KV_STRING, now);
     e->expires_at = expires_at;
     dshash_release_lock(kv_hash, e);
 
@@ -639,13 +835,13 @@ kv_set_one(const char *key, const char *data, Size len,
  * !strict) not a string. With strict, a non-string is an error.
  */
 static text *
-kv_get_one(const char *key, bool strict)
+kv_get_one(const KVKey *key, bool strict)
 {
     KVEntry    *e;
     text       *result;
     TimestampTz now;
 
-    e = dshash_find(kv_hash, key, false);
+    e = kv_find(key, false);
     if (e == NULL)
     {
         kv_count(&kv_shared->misses, 1);
@@ -668,8 +864,7 @@ kv_get_one(const char *key, bool strict)
         return NULL;
     }
     kv_touch(e, now);
-    result = cstring_to_text_with_len(dsa_get_address(kv_dsa, e->value),
-                                      (int) e->len);
+    result = cstring_to_text_with_len(kv_entry_value(e), (int) e->len);
     dshash_release_lock(kv_hash, e);
     kv_count(&kv_shared->hits, 1);
     return result;
@@ -679,7 +874,7 @@ kv_get_one(const char *key, bool strict)
 Datum
 kv_set(PG_FUNCTION_ARGS)
 {
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     text       *val;
     TimestampTz expires_at = KV_NEVER;
     bool        nx = !PG_ARGISNULL(3) && PG_GETARG_BOOL(3);
@@ -694,13 +889,12 @@ kv_set(PG_FUNCTION_ARGS)
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("memkv nx and xx cannot both be true")));
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
     val = PG_GETARG_TEXT_PP(1);
     if (!PG_ARGISNULL(2))
         expires_at = kv_expiry(PG_GETARG_DATUM(2));
 
-    kv_attach();
-    PG_RETURN_BOOL(kv_set_one(key, VARDATA_ANY(val), VARSIZE_ANY_EXHDR(val),
+    PG_RETURN_BOOL(kv_set_one(&key, VARDATA_ANY(val), VARSIZE_ANY_EXHDR(val),
                               expires_at,
                               nx ? KV_SET_NX : xx ? KV_SET_XX : KV_SET_ALWAYS));
 }
@@ -709,13 +903,12 @@ kv_set(PG_FUNCTION_ARGS)
 Datum
 kv_get(PG_FUNCTION_ARGS)
 {
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     text       *result;
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
-    kv_attach();
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
 
-    result = kv_get_one(key, true);
+    result = kv_get_one(&key, true);
     if (result == NULL)
         PG_RETURN_NULL();
     PG_RETURN_TEXT_P(result);
@@ -725,19 +918,18 @@ kv_get(PG_FUNCTION_ARGS)
 Datum
 kv_del(PG_FUNCTION_ARGS)
 {
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     KVEntry    *e;
     dsa_pointer val;
     bool        live;
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
-    kv_attach();
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
 
-    e = dshash_find(kv_hash, key, true);
+    e = kv_find(&key, true);
     if (e == NULL)
         PG_RETURN_BOOL(false);
     live = !kv_expired(e, GetCurrentTimestamp());
-    val = e->value;
+    val = e->data;
     dshash_delete_entry(kv_hash, e);
     dsa_free(kv_dsa, val);
     if (!live)
@@ -749,20 +941,19 @@ kv_del(PG_FUNCTION_ARGS)
 Datum
 kv_exists(PG_FUNCTION_ARGS)
 {
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     KVEntry    *e;
     bool        live;
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
-    kv_attach();
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
 
-    e = dshash_find(kv_hash, key, false);
+    e = kv_find(&key, false);
     if (e == NULL)
         PG_RETURN_BOOL(false);
     live = !kv_expired(e, GetCurrentTimestamp());
     dshash_release_lock(kv_hash, e);
     if (!live)
-        kv_remove_expired(key);
+        kv_remove_expired(&key);
     PG_RETURN_BOOL(live);
 }
 
@@ -770,7 +961,7 @@ kv_exists(PG_FUNCTION_ARGS)
 Datum
 kv_incr(PG_FUNCTION_ARGS)
 {
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     int64       amount = PG_GETARG_INT64(1);
     int64       cur = 0;
     int64       result = 0;
@@ -783,13 +974,12 @@ kv_incr(PG_FUNCTION_ARGS)
     TimestampTz now;
     Size        len;
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
-    kv_attach();
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
 
     /* Allocate before locking; any int64 fits in KV_INT_BUF bytes. */
-    newval = kv_alloc(KV_INT_BUF);
+    newval = kv_alloc_blob(&key, KV_INT_BUF);
 
-    e = kv_insert(key, newval, &found);
+    e = kv_insert(&key, newval, &found);
     now = GetCurrentTimestamp();
     if (found && !kv_expired(e, now))
     {
@@ -800,7 +990,7 @@ kv_incr(PG_FUNCTION_ARGS)
             dsa_free(kv_dsa, newval);
             kv_wrongtype();
         }
-        if (!kv_parse_int64(dsa_get_address(kv_dsa, e->value), e->len, &cur))
+        if (!kv_parse_int64(kv_entry_value(e), e->len, &cur))
             not_int = true;
     }
 
@@ -818,8 +1008,8 @@ kv_incr(PG_FUNCTION_ARGS)
                  errmsg("memkv increment would overflow")));
     }
 
-    len = pg_lltoa(result, dsa_get_address(kv_dsa, newval));
-    oldval = kv_store(e, found, newval, len, KV_STRING, now);
+    len = pg_lltoa(result, (char *) dsa_get_address(kv_dsa, newval) + key.len);
+    oldval = kv_store(e, found, newval, &key, len, KV_STRING, now);
     if (!live)
         e->expires_at = KV_NEVER;       /* new, or expired counts as missing */
     dshash_release_lock(kv_hash, e);
@@ -833,17 +1023,16 @@ kv_incr(PG_FUNCTION_ARGS)
 Datum
 kv_expire(PG_FUNCTION_ARGS)
 {
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     TimestampTz at;
     TimestampTz now;
     KVEntry    *e;
     bool        ok;
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
     at = kv_expiry(PG_GETARG_DATUM(1));
-    kv_attach();
 
-    e = dshash_find(kv_hash, key, true);
+    e = kv_find(&key, true);
     if (e == NULL)
         PG_RETURN_BOOL(false);
     now = GetCurrentTimestamp();
@@ -861,16 +1050,15 @@ kv_expire(PG_FUNCTION_ARGS)
 Datum
 kv_ttl(PG_FUNCTION_ARGS)
 {
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     KVEntry    *e;
     TimestampTz now;
     TimestampTz at;
     Interval   *result;
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
-    kv_attach();
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
 
-    e = dshash_find(kv_hash, key, false);
+    e = kv_find(&key, false);
     if (e == NULL)
         PG_RETURN_NULL();
     now = GetCurrentTimestamp();
@@ -878,7 +1066,7 @@ kv_ttl(PG_FUNCTION_ARGS)
     dshash_release_lock(kv_hash, e);
     if (at <= now)
     {
-        kv_remove_expired(key);
+        kv_remove_expired(&key);
         PG_RETURN_NULL();
     }
 
@@ -894,15 +1082,14 @@ kv_ttl(PG_FUNCTION_ARGS)
 Datum
 kv_persist(PG_FUNCTION_ARGS)
 {
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     KVEntry    *e;
     TimestampTz now;
     bool        ok;
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
-    kv_attach();
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
 
-    e = dshash_find(kv_hash, key, true);
+    e = kv_find(&key, true);
     if (e == NULL)
         PG_RETURN_BOOL(false);
     now = GetCurrentTimestamp();
@@ -948,7 +1135,7 @@ kv_mget(PG_FUNCTION_ARGS)
     int         i;
     int         dims[1];
     int         lbs[1] = {1};
-    char        key[KV_KEY_LEN];
+    KVKey       key;
 
     n = kv_text_array(PG_GETARG_ARRAYTYPE_P(0), "keys", &keys);
     if (n == 0)
@@ -961,8 +1148,8 @@ kv_mget(PG_FUNCTION_ARGS)
     {
         text       *v;
 
-        kv_key(DatumGetTextPP(keys[i]), key);
-        v = kv_get_one(key, false);
+        kv_key(DatumGetTextPP(keys[i]), &key);
+        v = kv_get_one(&key, false);
         nulls[i] = (v == NULL);
         vals[i] = v ? PointerGetDatum(v) : (Datum) 0;
     }
@@ -984,7 +1171,7 @@ kv_mset(PG_FUNCTION_ARGS)
     int         nvals;
     int         i;
     TimestampTz expires_at = KV_NEVER;
-    char        key[KV_KEY_LEN];
+    KVKey       key;
 
     if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
         ereport(ERROR,
@@ -999,17 +1186,12 @@ kv_mset(PG_FUNCTION_ARGS)
     if (!PG_ARGISNULL(2))
         expires_at = kv_expiry(PG_GETARG_DATUM(2));
 
-    /* Check every key before writing any. */
-    for (i = 0; i < nkeys; i++)
-        kv_key(DatumGetTextPP(keys[i]), key);
-
-    kv_attach();
     for (i = 0; i < nkeys; i++)
     {
         text       *v = DatumGetTextPP(vals[i]);
 
-        kv_key(DatumGetTextPP(keys[i]), key);
-        kv_set_one(key, VARDATA_ANY(v), VARSIZE_ANY_EXHDR(v), expires_at,
+        kv_key(DatumGetTextPP(keys[i]), &key);
+        kv_set_one(&key, VARDATA_ANY(v), VARSIZE_ANY_EXHDR(v), expires_at,
                    KV_SET_ALWAYS);
     }
     PG_RETURN_VOID();
@@ -1138,10 +1320,10 @@ kv_h_rewrite(const char *b, Size len, const char *field, uint32 flen,
  * entry's version and *present whether any entry (even expired) exists.
  */
 static char *
-kv_h_snapshot(const char *key, bool touch, Size *len, bool *present,
+kv_h_snapshot(const KVKey *key, bool touch, Size *len, bool *present,
               uint64 *version)
 {
-    KVEntry    *e = dshash_find(kv_hash, key, false);
+    KVEntry    *e = kv_find(key, false);
     TimestampTz now;
     char       *copy = NULL;
     bool        expired;
@@ -1162,7 +1344,7 @@ kv_h_snapshot(const char *key, bool touch, Size *len, bool *present,
         }
         *len = e->len;
         copy = palloc(Max(e->len, 1));
-        memcpy(copy, dsa_get_address(kv_dsa, e->value), e->len);
+        memcpy(copy, kv_entry_value(e), e->len);
         if (touch)
             kv_touch(e, now);
     }
@@ -1185,7 +1367,7 @@ typedef enum KVHashOp
  * if it existed, INCR true (with the new value in *incr_result).
  */
 static bool
-kv_h_write(const char *key, KVHashOp op, const char *field, uint32 flen,
+kv_h_write(const KVKey *key, KVHashOp op, const char *field, uint32 flen,
            const char *v, uint32 vlen, int64 amount, int64 *incr_result)
 {
     for (;;)
@@ -1234,12 +1416,12 @@ kv_h_write(const char *key, KVHashOp op, const char *field, uint32 flen,
         /* Allocate with no lock held, then commit if nothing changed. */
         if (kv_h_count(nb, nlen) > 0)
         {
-            np = kv_alloc_copy(nb, nlen);
+            np = kv_alloc_copy(key, nb, nlen);
             e = kv_insert(key, np, &found);
         }
         else
         {
-            e = dshash_find(kv_hash, key, true);
+            e = kv_find(key, true);
             found = (e != NULL);
         }
         now = GetCurrentTimestamp();
@@ -1265,14 +1447,14 @@ kv_h_write(const char *key, KVHashOp op, const char *field, uint32 flen,
         if (!DsaPointerIsValid(np))
         {
             /* Last field removed: drop the key. */
-            dsa_pointer val = e->value;
+            dsa_pointer val = e->data;
 
             dshash_delete_entry(kv_hash, e);
             dsa_free(kv_dsa, val);
         }
         else
         {
-            dsa_pointer oldval = kv_store(e, found, np, nlen, KV_HASH, now);
+            dsa_pointer oldval = kv_store(e, found, np, key, nlen, KV_HASH, now);
 
             if (old == NULL)
                 e->expires_at = KV_NEVER;   /* new, or replacing an expired key */
@@ -1311,13 +1493,12 @@ kv_field_len(text *t)
 Datum
 kv_hset(PG_FUNCTION_ARGS)
 {
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     text       *field = PG_GETARG_TEXT_PP(1);
     text       *val = PG_GETARG_TEXT_PP(2);
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
-    kv_attach();
-    PG_RETURN_BOOL(kv_h_write(key, KV_H_SET,
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
+    PG_RETURN_BOOL(kv_h_write(&key, KV_H_SET,
                               VARDATA_ANY(field), kv_field_len(field),
                               VARDATA_ANY(val), kv_field_len(val), 0, NULL));
 }
@@ -1326,7 +1507,7 @@ kv_hset(PG_FUNCTION_ARGS)
 Datum
 kv_hget(PG_FUNCTION_ARGS)
 {
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     text       *field = PG_GETARG_TEXT_PP(1);
     char       *b;
     Size        len;
@@ -1335,10 +1516,9 @@ kv_hget(PG_FUNCTION_ARGS)
     const char *v;
     uint32      vlen;
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
-    kv_attach();
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
 
-    b = kv_h_snapshot(key, true, &len, &present, &version);
+    b = kv_h_snapshot(&key, true, &len, &present, &version);
     if (b == NULL ||
         !kv_h_lookup(b, len, VARDATA_ANY(field), kv_field_len(field), &v, &vlen))
     {
@@ -1353,12 +1533,11 @@ kv_hget(PG_FUNCTION_ARGS)
 Datum
 kv_hdel(PG_FUNCTION_ARGS)
 {
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     text       *field = PG_GETARG_TEXT_PP(1);
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
-    kv_attach();
-    PG_RETURN_BOOL(kv_h_write(key, KV_H_DEL,
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
+    PG_RETURN_BOOL(kv_h_write(&key, KV_H_DEL,
                               VARDATA_ANY(field), kv_field_len(field),
                               NULL, 0, 0, NULL));
 }
@@ -1367,16 +1546,15 @@ kv_hdel(PG_FUNCTION_ARGS)
 Datum
 kv_hlen(PG_FUNCTION_ARGS)
 {
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     char       *b;
     Size        len;
     bool        present;
     uint64      version;
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
-    kv_attach();
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
 
-    b = kv_h_snapshot(key, false, &len, &present, &version);
+    b = kv_h_snapshot(&key, false, &len, &present, &version);
     PG_RETURN_INT64(b == NULL ? 0 : (int64) kv_h_count(b, len));
 }
 
@@ -1384,14 +1562,13 @@ kv_hlen(PG_FUNCTION_ARGS)
 Datum
 kv_hincr(PG_FUNCTION_ARGS)
 {
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     text       *field = PG_GETARG_TEXT_PP(1);
     int64       amount = PG_GETARG_INT64(2);
     int64       result = 0;
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
-    kv_attach();
-    kv_h_write(key, KV_H_INCR, VARDATA_ANY(field), kv_field_len(field),
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
+    kv_h_write(&key, KV_H_INCR, VARDATA_ANY(field), kv_field_len(field),
                NULL, 0, amount, &result);
     PG_RETURN_INT64(result);
 }
@@ -1401,7 +1578,7 @@ Datum
 kv_hgetall(PG_FUNCTION_ARGS)
 {
     ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-    char        key[KV_KEY_LEN];
+    KVKey       key;
     char       *b;
     Size        len;
     bool        present;
@@ -1412,11 +1589,10 @@ kv_hgetall(PG_FUNCTION_ARGS)
     uint32      flen;
     uint32      vlen;
 
-    kv_key(PG_GETARG_TEXT_PP(0), key);
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
     InitMaterializedSRF(fcinfo, 0);
-    kv_attach();
 
-    b = kv_h_snapshot(key, true, &len, &present, &version);
+    b = kv_h_snapshot(&key, true, &len, &present, &version);
     if (b == NULL)
     {
         kv_count(&kv_shared->misses, 1);
@@ -1464,9 +1640,10 @@ kv_flush(PG_FUNCTION_ARGS)
 }
 
 /*
- * kv_stats() -> one row: live keys, keys with a TTL, value memory in use
- * (DSA segments, so it includes free space inside them), the cap, and
- * server-wide hit/miss/eviction/expiry counters since the store was made.
+ * kv_stats() -> one row: live keys, keys with a TTL, memory in use (DSA
+ * segments holding keys, values and the index, so it includes free space
+ * inside them), the cap, and server-wide hit/miss/eviction/expiry counters
+ * since the store was made.
  * Counting keys scans the index, so this is O(keys).
  */
 Datum
@@ -1508,3 +1685,25 @@ kv_stats(PG_FUNCTION_ARGS)
     tupdesc = BlessTupleDesc(tupdesc);
     PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
+
+#ifdef USE_ASSERT_CHECKING
+/*
+ * Test hook, assertion builds only, not part of the extension script: the
+ * stress test creates it by hand. Prints the allocator's internal state to the
+ * server log, so a test can check that a flushed store holds nothing but the
+ * index's own structures.
+ */
+PG_FUNCTION_INFO_V1(kv_debug_dsa);
+
+Datum
+kv_debug_dsa(PG_FUNCTION_ARGS)
+{
+    if (!superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("must be superuser to dump the memkv allocator")));
+    kv_attach();
+    dsa_dump(kv_dsa);
+    PG_RETURN_VOID();
+}
+#endif

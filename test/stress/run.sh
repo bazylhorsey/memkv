@@ -66,10 +66,33 @@ SQL
 
 $PSQL -c "CREATE EXTENSION IF NOT EXISTS memkv" >/dev/null 2>&1
 
-# Baseline for the leak check at the end, taken before any workload runs.
-set_cap 8
-base=$(fill_capacity)
-printf '      baseline: %s 1000-byte values fit in an 8MB store\n' "$base"
+# An exact leak oracle, for servers built with assertions. PostgreSQL's
+# dsa_dump() lists every allocator span with how many of its objects are free,
+# and kv_debug_dsa() sends that to the server log. After a flush only the
+# index's own structures may be allocated: its control block and its bucket
+# array. Needs MEMKV_TEST_LOG. have_dump=0 when it isn't available.
+have_dump=0
+if [ -n "${MEMKV_TEST_LOG:-}" ] &&
+   $PSQL -c "CREATE OR REPLACE FUNCTION kv_debug_dsa() RETURNS void AS '\$libdir/memkv', 'kv_debug_dsa' LANGUAGE C" >/dev/null 2>&1; then
+    have_dump=1
+fi
+
+live_objects() {    # flush, dump the allocator, count what is still allocated
+    local mark
+    $PSQL -c "SELECT kv_flush()" >/dev/null
+    mark=$(log_mark)
+    $PSQL -c "SELECT kv_debug_dsa()" >/dev/null
+    tail -c +"$((mark + 1))" "$MEMKV_TEST_LOG" | awk '
+        /pool for size class/            { mode = "small"; next }
+        /pool for large object spans/    { mode = "large"; next }
+        /pool for blocks of span objects/ { mode = ""; next }
+        /objects free = /                { split($NF, a, "/")
+                                           if (mode == "small") live += a[2] - a[1]
+                                           else if (mode == "large") live += 1 }
+        END { print live + 0 }'
+}
+
+[ "$have_dump" -eq 1 ] && base_live=$(live_objects)
 
 # --- 1. exact counters: no lost kv_incr updates -----------------------------
 set_cap 64
@@ -126,29 +149,39 @@ else
     bad "mixed: eviction=$evicted expiry=$expired, so a path was never exercised"
 fi
 
-# --- 5. leak check: after all of that, a flush must give the whole cap back --
-# A leaked allocation pins its superblock, so the number of 1000-byte values
-# that fit after kv_flush() would drop below the baseline taken at the start.
+# --- 5. leak check ----------------------------------------------------------
+# Run the mixed workload again and again, flush after each run, and count how
+# many 1000-byte values fit. The index bucket array only ever grows, and where
+# it sits splits the free pages differently from run to run, so the count
+# wobbles by a few percent. That is not a leak, so it can't be the check by
+# itself; the allocator dump below is.
 mark=$(log_mark)
 caps=()
-for cycle in 1 2 3; do
+for round in 1 2 3; do
+    pgb "leak round $round" -c "$CLIENTS" -T 8 -f mixed.sql || break
     caps+=("$(fill_capacity)")
 done
-printf '      keys that fit: baseline %s, after the workloads %s\n' "$base" "${caps[*]}"
-leaked=0
-for v in "${caps[@]}"; do
-    [ "$v" -lt $((base * 99 / 100)) ] && leaked=1
-done
-if [ "$leaked" -eq 0 ]; then
-    ok "leak: the store holds its baseline $base keys again after every workload and a flush"
-else
-    bad "leak: capacity after kv_flush() fell below the baseline of $base keys (${caps[*]})"
+printf '      keys that fit after each run of the workload and a flush: %s\n' "${caps[*]}"
+if [ "${#caps[@]}" -eq 3 ]; then
+    if [ "$have_dump" -eq 1 ]; then
+        after_live=$(live_objects)
+        if [ "$after_live" = "$base_live" ]; then
+            ok "leak: after every workload and a flush $after_live objects are allocated, as on a fresh store (the index's own)"
+        else
+            bad "leak: $after_live objects still allocated after a flush, $base_live on a fresh store"
+        fi
+    elif [ "${caps[2]}" -ge $((caps[1] * 95 / 100)) ]; then
+        ok "leak: capacity is steady (${caps[1]}, then ${caps[2]}); run on an assertion build with MEMKV_TEST_LOG for the exact check"
+    else
+        bad "leak: capacity fell from ${caps[1]} to ${caps[2]} between identical runs"
+    fi
 fi
 left=$($PSQL -c "SELECT kv_flush()" -c "SELECT keys FROM kv_stats()" | tail -1)
 [ "$left" = "0" ] || bad "leak: $left keys left after kv_flush()"
 log_check "$mark" "leak"
 
 $PSQL -c "SELECT kv_flush()" >/dev/null
+[ "$have_dump" -eq 1 ] && $PSQL -c "DROP FUNCTION IF EXISTS kv_debug_dsa()" >/dev/null
 $PSQL -c "ALTER SYSTEM RESET memkv.max_memory" -c "SELECT pg_reload_conf()" >/dev/null
 
 echo
