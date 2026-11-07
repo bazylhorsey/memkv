@@ -95,8 +95,9 @@ typedef struct KVEntry
     KVHash      hash;               /* hash key: must be first */
     dsa_pointer data;               /* key bytes, then value bytes, in kv_dsa */
     uint32      klen;               /* length of the key at the start of data */
+    uint32      len;                /* length of the value after the key */
+    uint32      vcap;               /* bytes allocated for the value (>= len) */
     uint8       type;               /* KVType */
-    Size        len;                /* length of the value after the key */
     TimestampTz expires_at;
     uint64      version;            /* changes whenever value changes */
     pg_atomic_uint64 atime;         /* last access; written under a shared lock */
@@ -740,16 +741,20 @@ kv_insert(const KVKey *key, dsa_pointer newval, bool *found)
     return e;
 }
 
-/* Point a locked entry at a new allocation. Returns the old one to free. */
+/*
+ * Point a locked entry at a new allocation holding len bytes of value, with room
+ * for vcap. Returns the old allocation to free.
+ */
 static dsa_pointer
 kv_store(KVEntry *e, bool found, dsa_pointer newval, const KVKey *key,
-         Size len, KVType type, TimestampTz now)
+         Size len, Size vcap, KVType type, TimestampTz now)
 {
     dsa_pointer oldval = found ? e->data : InvalidDsaPointer;
 
     e->data = newval;
     e->klen = (uint32) key->len;
-    e->len = len;
+    e->len = (uint32) len;
+    e->vcap = (uint32) vcap;
     e->type = (uint8) type;
     e->version = kv_next_version();
     pg_atomic_init_u64(&e->atime, (uint64) now);
@@ -817,6 +822,17 @@ typedef enum KVSetCond
     KV_SET_XX                       /* only if the key exists */
 } KVSetCond;
 
+/*
+ * Can a value of len bytes go where one of vcap bytes was? Not if it would
+ * leave more than half the space unused, or the key could keep a big
+ * allocation for good after one big value.
+ */
+static inline bool
+kv_fits(Size vcap, Size len)
+{
+    return len <= vcap && vcap - len <= Max(32, vcap / 2);
+}
+
 /* Set one string key. Returns false if cond stopped the write. */
 static bool
 kv_set_one(const KVKey *key, const char *data, Size len,
@@ -827,6 +843,40 @@ kv_set_one(const KVKey *key, const char *data, Size len,
     KVEntry    *e;
     bool        found;
     TimestampTz now;
+
+    /*
+     * Overwriting a key that is already there with a value of about the same
+     * size is the common case, and it needs no allocation: write over it under
+     * the entry's own lock. That keeps writers off the allocator's lock, which
+     * is what limited them before.
+     */
+    e = kv_find(key, true);
+    if (e != NULL)
+    {
+        now = GetCurrentTimestamp();
+        if ((cond == KV_SET_NX && !kv_expired(e, now)) ||
+            (cond == KV_SET_XX && kv_expired(e, now)))
+        {
+            dshash_release_lock(kv_hash, e);
+            return false;
+        }
+        if (kv_fits(e->vcap, len))
+        {
+            memcpy(kv_entry_value(e), data, len);
+            e->len = (uint32) len;
+            e->type = KV_STRING;
+            e->version = kv_next_version();
+            e->expires_at = expires_at;
+            kv_touch(e, now);
+            dshash_release_lock(kv_hash, e);
+            return true;
+        }
+        dshash_release_lock(kv_hash, e);
+    }
+    else if (cond == KV_SET_XX)
+        return false;
+
+    /* A new key, or a value that doesn't fit where the old one was. */
 
     /* Copy the key and value into shared memory before taking any lock. */
     newval = kv_alloc_copy(key, data, len);
@@ -855,7 +905,7 @@ kv_set_one(const KVKey *key, const char *data, Size len,
         }
     }
 
-    oldval = kv_store(e, found, newval, key, len, KV_STRING, now);
+    oldval = kv_store(e, found, newval, key, len, len, KV_STRING, now);
     e->expires_at = expires_at;
     dshash_release_lock(kv_hash, e);
 
@@ -991,6 +1041,18 @@ kv_exists(PG_FUNCTION_ARGS)
     PG_RETURN_BOOL(live);
 }
 
+static pg_noreturn void
+kv_incr_error(bool not_int)
+{
+    if (not_int)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+                 errmsg("memkv value is not an integer")));
+    ereport(ERROR,
+            (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+             errmsg("memkv increment would overflow")));
+}
+
 /* kv_incr(key, amount DEFAULT 1) -> new value; keeps an existing TTL */
 Datum
 kv_incr(PG_FUNCTION_ARGS)
@@ -1007,8 +1069,54 @@ kv_incr(PG_FUNCTION_ARGS)
     KVEntry    *e;
     TimestampTz now;
     Size        len;
+    char        digits[KV_INT_BUF];
 
     kv_key(PG_GETARG_TEXT_PP(0), &key);
+
+    /*
+     * The common case is a counter that exists and whose new number fits where
+     * the old one was: update it under the entry's own lock, with no allocation.
+     */
+    e = kv_find(&key, true);
+    if (e != NULL)
+    {
+        now = GetCurrentTimestamp();
+        live = !kv_expired(e, now);
+        if (live)
+        {
+            if (e->type != KV_STRING)
+            {
+                dshash_release_lock(kv_hash, e);
+                kv_wrongtype();
+            }
+            if (!kv_parse_int64(kv_entry_value(e), e->len, &cur))
+                not_int = true;
+        }
+        if (not_int || pg_add_s64_overflow(cur, amount, &result))
+        {
+            dshash_release_lock(kv_hash, e);
+            kv_incr_error(not_int);
+        }
+        len = pg_lltoa(result, digits);
+        if (len <= e->vcap)
+        {
+            memcpy(kv_entry_value(e), digits, len);
+            e->len = (uint32) len;
+            e->type = KV_STRING;
+            e->version = kv_next_version();
+            if (!live)
+                e->expires_at = KV_NEVER;   /* expired counts as missing */
+            kv_touch(e, now);
+            dshash_release_lock(kv_hash, e);
+            PG_RETURN_INT64(result);
+        }
+        dshash_release_lock(kv_hash, e);
+        live = false;
+        not_int = false;
+        cur = 0;
+    }
+
+    /* A new counter, or a number that has outgrown its space. */
 
     /* Allocate before locking; any int64 fits in KV_INT_BUF bytes. */
     newval = kv_alloc_blob(&key, KV_INT_BUF);
@@ -1033,17 +1141,11 @@ kv_incr(PG_FUNCTION_ARGS)
         /* Leave the stored value alone; report after unlocking. */
         dshash_release_lock(kv_hash, e);
         dsa_free(kv_dsa, newval);
-        if (not_int)
-            ereport(ERROR,
-                    (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-                     errmsg("memkv value is not an integer")));
-        ereport(ERROR,
-                (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-                 errmsg("memkv increment would overflow")));
+        kv_incr_error(not_int);
     }
 
     len = pg_lltoa(result, (char *) dsa_get_address(kv_dsa, newval) + key.len);
-    oldval = kv_store(e, found, newval, &key, len, KV_STRING, now);
+    oldval = kv_store(e, found, newval, &key, len, KV_INT_BUF, KV_STRING, now);
     if (!live)
         e->expires_at = KV_NEVER;       /* new, or expired counts as missing */
     dshash_release_lock(kv_hash, e);
@@ -1488,7 +1590,7 @@ kv_h_write(const KVKey *key, KVHashOp op, const char *field, uint32 flen,
         }
         else
         {
-            dsa_pointer oldval = kv_store(e, found, np, key, nlen, KV_HASH, now);
+            dsa_pointer oldval = kv_store(e, found, np, key, nlen, nlen, KV_HASH, now);
 
             if (old == NULL)
                 e->expires_at = KV_NEVER;   /* new, or replacing an expired key */
@@ -1803,7 +1905,7 @@ kv_rate_limit_core(const KVKey *key, int64 capacity, int64 period, int64 cost,
         else
         {
             dsa_pointer oldval = kv_store(e, found, newval, key, sizeof(int64),
-                                          KV_BUCKET, now);
+                                          sizeof(int64), KV_BUCKET, now);
 
             tat = 0;                    /* long ago, so the bucket is full */
             memcpy(kv_entry_value(e), &tat, sizeof(tat));
@@ -2038,7 +2140,7 @@ kv_verify(PG_FUNCTION_ARGS)
             continue;
         }
         if (!DsaPointerIsValid(e->data) || e->klen > MaxAllocSize ||
-            e->len > MaxAllocSize)
+            e->len > MaxAllocSize || e->vcap > MaxAllocSize)
         {
             kv_verify_report(rsinfo, NULL, "an entry has an invalid pointer or length");
             continue;
@@ -2058,6 +2160,8 @@ kv_verify(PG_FUNCTION_ARGS)
         {
             kv_verify_report(rsinfo, label, "the entry has no version");
         }
+        if (e->len > e->vcap)
+            kv_verify_report(rsinfo, label, "the value is longer than the space for it");
         if (e->type == KV_BUCKET && e->len != sizeof(int64))
         {
             kv_verify_report(rsinfo, label, "a rate limiter is %zu bytes, not 8", (size_t) e->len);
@@ -2126,7 +2230,8 @@ kv_debug_dsa(PG_FUNCTION_ARGS)
  * Test hook, assertion builds only: damage one entry on purpose, so a test can
  * check that verify() notices. what is one of: hash (the key no longer matches
  * its hash), type (an unknown kind), len (a hash or limiter of the wrong size),
- * klen (the key length is off by one). The store should be flushed afterwards.
+ * klen (the key length is off by one), cap (the value longer than its space). The
+ * store should be flushed afterwards.
  */
 PG_FUNCTION_INFO_V1(kv_debug_corrupt);
 
@@ -2155,6 +2260,8 @@ kv_debug_corrupt(PG_FUNCTION_ARGS)
         e->len -= 1;
     else if (strcmp(what, "klen") == 0)
         e->klen += 1;
+    else if (strcmp(what, "cap") == 0)
+        e->len = e->vcap + 1;
     else
     {
         dshash_release_lock(kv_hash, e);

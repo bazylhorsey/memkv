@@ -4,14 +4,18 @@
 -- and eviction runs constantly. Keys that start with "ts" have a 20 ms TTL, so
 -- they expire before eviction reaches them; "tl" keys have a 1 s TTL and are
 -- normally evicted first. Key families never share a type: k* and t* are
--- strings, c* are counters, h* and hc* are hashes, rl* are rate limiters.
+-- strings (v* get a new random size every time), c* are counters, h* and hc*
+-- are hashes, rl* are rate limiters.
 -- Run through test/stress/run.sh.
 \set k random(1, 20000)
 \set r random(1, 200)
+\set sz random(1, 1000)
 \if :r <= 56
   SELECT memkv.get('k' || :k::text);
-\elif :r <= 92
+\elif :r <= 80
   SELECT memkv.set('k' || :k::text, repeat('v', 100 + :k % 900));
+\elif :r <= 92
+  SELECT memkv.set('v' || (:k % 500)::text, repeat('r', :sz));
 \elif :r <= 98
   SELECT memkv.set('k' || :k::text, repeat('n', 100 + :k % 900), nx => true);
 \elif :r <= 102

@@ -39,7 +39,7 @@ DECLARE
     what    text;
     n       int;
 BEGIN
-    FOREACH what IN ARRAY ARRAY['hash', 'type', 'len', 'klen'] LOOP
+    FOREACH what IN ARRAY ARRAY['hash', 'type', 'len', 'klen', 'cap'] LOOP
         PERFORM memkv.flush();
         PERFORM memkv.set('s', 'a string');
         PERFORM memkv.hset('h', 'f', 'v');
