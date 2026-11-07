@@ -25,7 +25,7 @@ SELECT kv_get('hot') = 'keep me'                    AS hot_survived;   -- t
 SELECT kv_get('k1') IS NULL                         AS oldest_evicted; -- t
 SELECT kv_get('k5000') IS NOT NULL                  AS newest_kept;    -- t
 SELECT count(*) FILTER (WHERE kv_get('k' || i) IS NOT NULL) AS live_keys
-FROM generate_series(1, 5000) i;                                       -- roughly 700-900
+FROM generate_series(1, 5000) i;                                       -- roughly 500-700 (the cap covers the index too)
 
 -- 2. Expired keys are dropped before any live key is evicted.
 SELECT kv_flush();
