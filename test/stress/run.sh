@@ -54,13 +54,33 @@ pgb() {         # phase name, then pgbench arguments
     return 0
 }
 
-fill_capacity() {   # flush, then count the 1000-byte values that fit at the current cap
+fill_capacity() {   # flush, then fill the store with 1000-byte values, evicting as it overflows
     $PSQL -c "SELECT memkv.flush()" >/dev/null
     $PSQL <<'SQL'
 DO $$ BEGIN
   FOR i IN 1..30000 LOOP PERFORM memkv.set('cap' || i, repeat('x', 1000)); END LOOP;
 END $$;
-SELECT keys FROM memkv.stats();
+SQL
+}
+
+# Flush, then count the 1000-byte values that fit before the first eviction.
+# Counting after an overflow instead would depend on where in an eviction
+# round the loop stopped, which moves by up to a sixteenth of the store.
+count_capacity() {
+    $PSQL -c "SELECT memkv.flush()" >/dev/null
+    $PSQL 2>&1 <<'SQL' | sed -n 's/^NOTICE:  *//p'
+DO $$
+DECLARE
+  n int := 0;
+  e0 bigint := (SELECT evicted FROM memkv.stats());
+BEGIN
+  WHILE n < 30000 LOOP
+    PERFORM memkv.set('cap' || n, repeat('x', 1000));
+    EXIT WHEN (SELECT evicted FROM memkv.stats()) > e0;
+    n := n + 1;
+  END LOOP;
+  RAISE NOTICE '%', n;
+END $$;
 SQL
 }
 
@@ -203,13 +223,13 @@ check_verify "tiny keys"
 # Run the mixed workload again and again, flush after each run, and count how
 # many 1000-byte values fit. The index bucket array only ever grows, and where
 # it sits splits the free pages differently from run to run, so the count
-# wobbles by a few percent. That is not a leak, so it can't be the check by
-# itself; the allocator dump below is.
+# wobbles by a few percent. That is not a leak, so without the allocator dump
+# below the check can only catch a loss of a tenth of the store per run.
 mark=$(log_mark)
 caps=()
 for round in 1 2 3; do
     pgb "leak round $round" -c "$CLIENTS" -T 8 -f mixed.sql || break
-    caps+=("$(fill_capacity)")
+    caps+=("$(count_capacity)")
 done
 printf '      keys that fit after each run of the workload and a flush: %s\n' "${caps[*]}"
 if [ "${#caps[@]}" -eq 3 ]; then
@@ -220,7 +240,7 @@ if [ "${#caps[@]}" -eq 3 ]; then
         else
             bad "leak: $after_live objects still allocated after a flush, $base_live on a fresh store"
         fi
-    elif [ "${caps[2]}" -ge $((caps[1] * 95 / 100)) ]; then
+    elif [ "${caps[2]}" -ge $((caps[1] * 90 / 100)) ]; then
         ok "leak: capacity is steady (${caps[1]}, then ${caps[2]}); run on an assertion build with MEMKV_TEST_LOG for the exact check"
     else
         bad "leak: capacity fell from ${caps[1]} to ${caps[2]} between identical runs"

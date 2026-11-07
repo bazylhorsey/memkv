@@ -44,12 +44,20 @@ PG_MODULE_MAGIC;
 
 /*
  * Eviction tuning. Each eviction round scans the whole index once and
- * evicts about 1/128 of the live keys (at least one), oldest first. Later
+ * evicts about 1/16 of the live keys (at least one), oldest first. Later
  * rounds within the same allocation double that, so a large value that
  * needs many small ones gone doesn't take hundreds of scans.
+ *
+ * The scan costs time in proportion to the number of keys, and everyone who
+ * needs memory waits for it, so evicting a fixed handful per scan would make a
+ * store with a million keys scan every few thousand writes. A share of the store
+ * keeps that to one scan per sixteenth of it, for a few percent of capacity that
+ * is empty just after a round. The candidates are kept in a heap, sized from how
+ * many keys the last round saw.
  */
-#define KV_EVICT_SHIFT      7       /* evict nlive >> 7 per round */
-#define KV_EVICT_MAX        4096    /* at most this many keys per round */
+#define KV_EVICT_SHIFT      4       /* evict nlive >> 4 per round */
+#define KV_EVICT_POOL_MIN   4096    /* fewest candidates a round can pick from */
+#define KV_EVICT_POOL_MAX   262144  /* most (6 MB), so the heap stays modest */
 #define KV_EVICT_STALLS     8       /* give up after this many empty rounds */
 
 typedef enum KVEvictionPolicy
@@ -115,6 +123,7 @@ typedef struct KVShared
     dshash_table_handle index_handle;   /* the index, which lives in kv_dsa */
     int         index_tranche;      /* its LWLock tranche */
     LWLock      reclaim_lock;       /* one backend at a time frees memory */
+    pg_atomic_uint64 evict_hint;    /* live keys the last eviction round saw */
 } KVShared;
 
 /* An eviction candidate, copied out of the index during a scan. */
@@ -227,6 +236,7 @@ kv_shared_init(void *ptr, void *arg)
     pg_atomic_init_u64(&s->evicted, 0);
     pg_atomic_init_u64(&s->expired, 0);
     pg_atomic_init_u64(&s->version, 0);
+    pg_atomic_init_u64(&s->evict_hint, 0);
 
     if (!pg_strong_random(&s->hash_seed, sizeof(s->hash_seed)))
         s->hash_seed = (uint64) GetCurrentTimestamp() ^
@@ -495,7 +505,7 @@ kv_candidate_cmp(const void *a, const void *b)
  * eligible for eviction. Must be called without holding any dshash lock.
  */
 static int64
-kv_evict_round(KVCandidate *pool, int round, int *ncand)
+kv_evict_round(KVCandidate *pool, int pool_cap, int round, int *ncand)
 {
     dshash_seq_status status;
     KVEntry    *e;
@@ -521,10 +531,11 @@ kv_evict_round(KVCandidate *pool, int round, int *ncand)
         if (kv_eviction_policy == KV_EVICT_VOLATILE_LRU &&
             e->expires_at == KV_NEVER)
             continue;
-        kv_pool_offer(pool, &npool, KV_EVICT_MAX, e, kv_atime(e));
+        kv_pool_offer(pool, &npool, pool_cap, e, kv_atime(e));
     }
     dshash_seq_term(&status);
     kv_count(&kv_shared->expired, expired);
+    pg_atomic_write_u64(&kv_shared->evict_hint, (uint64) nlive);
 
     *ncand = npool;
     if (expired > 0 || npool == 0)
@@ -560,6 +571,7 @@ kv_evict_round(KVCandidate *pool, int round, int *ncand)
 typedef struct KVReclaim
 {
     KVCandidate *pool;
+    int         pool_cap;
     int         round;
     int         stalls;
 } KVReclaim;
@@ -596,8 +608,14 @@ kv_reclaim(KVReclaim *rc)
     }
 
     if (rc->pool == NULL)
-        rc->pool = palloc(sizeof(KVCandidate) * KV_EVICT_MAX);
-    freed = kv_evict_round(rc->pool, rc->round++, &ncand);
+    {
+        uint64      hint = pg_atomic_read_u64(&kv_shared->evict_hint);
+
+        rc->pool_cap = (int) Max(KV_EVICT_POOL_MIN,
+                                 Min(hint >> KV_EVICT_SHIFT, KV_EVICT_POOL_MAX));
+        rc->pool = palloc(sizeof(KVCandidate) * rc->pool_cap);
+    }
+    freed = kv_evict_round(rc->pool, rc->pool_cap, rc->round++, &ncand);
     if (freed > 0)
         rc->stalls = 0;
     else if (ncand == 0 || ++rc->stalls >= KV_EVICT_STALLS)

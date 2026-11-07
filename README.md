@@ -126,10 +126,16 @@ or nothing evictable is left (then it errors with `memkv is full`). One backend 
 wait and retry their allocation first, since the evictor may have freed what they need.
 
 - A key's "last used" time is updated by `get`, `set`, `incr` and `expire`.
-- Each eviction round scans the index once and evicts the oldest ~1/128 of live keys (at least 1, at most
-  4096), doubling each further round within the same write. Evicting a batch at once means a store that stays
-  full scans rarely instead of on every write. It does mean a full store usually sits up to ~1% below the cap
-  right after an eviction.
+- Each eviction round scans the index once and evicts the oldest ~1/16 of live keys (at least 1, at most
+  262,144), doubling each further round within the same write. The scan takes time in proportion to the number
+  of keys and everyone who needs memory waits for it, so evicting a share of the store at once, not a fixed
+  handful, is what keeps a store with millions of keys from scanning constantly. It does mean a full store
+  usually sits a few percent below the cap right after a round.
+- The scan costs about 70 ns per key: roughly 80 ms for a million keys in a 4-CPU container. Writes that are
+  waiting for memory wait that long; reads and in-place updates carry on, apart from short waits on the part of
+  the index being scanned. A store that is always full and always being written to spends that time every second
+  or two, so give `memkv.max_memory` room to spare, and use TTLs with a regular `sweep()` so expired keys are
+  dropped in the background instead of by a writer.
 - Unlike Valkey's random sampling, the scan sees every key, so the keys evicted really are the oldest ones. A
   key used between the scan and its eviction is skipped.
 - A single entry (key and value) at least as large as `memkv.max_memory` is rejected without evicting
