@@ -311,7 +311,7 @@ kv_atime(KVEntry *e)
     return (TimestampTz) pg_atomic_read_u64(&e->atime);
 }
 
-static pg_noreturn void
+pg_noreturn static void
 kv_wrongtype(void)
 {
     ereport(ERROR,
@@ -576,7 +576,7 @@ typedef struct KVReclaim
     int         stalls;
 } KVReclaim;
 
-static pg_noreturn void
+pg_noreturn static void
 kv_full_error(void)
 {
     ereport(ERROR,
@@ -1059,7 +1059,7 @@ kv_exists(PG_FUNCTION_ARGS)
     PG_RETURN_BOOL(live);
 }
 
-static pg_noreturn void
+pg_noreturn static void
 kv_incr_error(bool not_int)
 {
     if (not_int)
