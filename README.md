@@ -211,6 +211,13 @@ ci/assert.sh /path/to/pg19     # a PostgreSQL 19 built with --enable-cassert: al
 
 GitHub runs both on every push and pull request.
 
+## Benchmarks
+
+`bench/run.sh` compares memkv with an UNLOGGED table, and `bench/valkey.sh` with Valkey. `bench/h2h/run.sh`
+and `bench/h2h/scenarios.sh` compare it with [pg_kv](https://github.com/Murat7Ay/pg_kv) in Docker, both servers
+on the same CPU quota and the client in a separate container; they explain how to build pg_kv for your
+machine's architecture, because its published image is amd64 only.
+
 ## License
 
 PostgreSQL License. See [LICENSE](LICENSE).
