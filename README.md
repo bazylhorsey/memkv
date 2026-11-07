@@ -192,15 +192,24 @@ SELECT count(*) FROM memkv.verify();    -- 0
 Run these against a scratch server. Each prints nothing and exits 0 when it passes:
 
 ```sh
-for t in keys rate_limit errors access verify; do psql -X -v ON_ERROR_STOP=1 -f test/$t.sql; done
+for t in keys overwrite rate_limit errors access verify; do psql -X -v ON_ERROR_STOP=1 -f test/$t.sql; done
 psql -X -v ON_ERROR_STOP=1 -f test/eviction.sql     # shrinks memkv.max_memory to 1MB while it runs
 test/stress/run.sh 30 32                            # 32 clients; set MEMKV_TEST_LOG=<server log> on assertion builds
 ```
 
 `test/commands.sql` is a walk-through of every function with the expected results in its comments.
 `test/collision.sql`, and the damage detection in `test/verify.sql`, need a server built with assertions and
-skip themselves otherwise. `test/stress/run.sh` has two modes of leak check: on an assertion build it reads
+skip themselves otherwise. `test/stress/run.sh` has two kinds of leak check: on an assertion build it reads
 PostgreSQL's allocator dump and requires that a flush leaves only the index's own structures allocated.
+
+To run everything without setting anything up:
+
+```sh
+ci/run.sh                      # builds the Docker image and tests it
+ci/assert.sh /path/to/pg19     # a PostgreSQL 19 built with --enable-cassert: also the assertion-only tests
+```
+
+GitHub runs both on every push and pull request.
 
 ## License
 
