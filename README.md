@@ -92,6 +92,12 @@ SELECT * FROM memkv.rate_limit_info('upload:' || user_id, 50, interval '1 hour',
   exactly its capacity. The stress test has 32 clients race for 1000 slots and checks that 1000 get through.
 - A limiter is one 8-byte value. An absent limiter counts as a full one, and its TTL is the moment it would be
   full again, so idle limiters expire by themselves.
+- A limiter is never more than one period ahead of now. If you shorten the period, or the server's clock goes
+  backwards, a limiter that was further ahead is pulled back, instead of staying shut for as long as the old
+  period or the clock step was.
+- Time is counted in microseconds and each request moves a limiter forward by the period divided by the capacity,
+  rounded down, so a very fast limiter is slightly generous: by at most 1% at 10,000 requests a second on one key
+  and 10% at 100,000. A capacity of more than one per microsecond is refused.
 - `retry_after_ms` is 0 when allowed, otherwise how long until this same call would pass. `reset_after_ms` is
   how long until the bucket is full again.
 - It is a kind of value like a string or a hash: `get` on it is `wrong_object_type`, and `set` replaces it.
@@ -155,7 +161,7 @@ Every error carries a SQLSTATE, so clients can react without parsing messages:
 |---|---|---|
 | `42809` | `wrong_object_type` | the key holds another kind of value: `get` on a hash, `hset` on a string, `rate_limit` on either |
 | `22004` | `null_value_not_allowed` | a NULL key or value, or a NULL inside the arrays of `mget` and `mset` |
-| `22023` | `invalid_parameter_value` | `nx` and `xx` together; a TTL that isn't positive; a rate limit capacity, period or cost that isn't positive, or a cost over the capacity |
+| `22023` | `invalid_parameter_value` | `nx` and `xx` together; a TTL that isn't positive; a rate limit capacity, period or cost that isn't positive (a period of `-infinity` too), a cost over the capacity, or a capacity of more than one per microsecond |
 | `22P02` | `invalid_text_representation` | `incr` or `hincr` on a value that is not an integer |
 | `22003` | `numeric_value_out_of_range` | `incr` or `hincr` overflow |
 | `2202E` | `array_subscript_error` | `mget` or `mset` arrays that aren't one-dimensional, or keys and values of different lengths |

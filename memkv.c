@@ -1918,6 +1918,11 @@ kv_stats(PG_FUNCTION_ARGS)
  * would be full again, so idle buckets expire by themselves. The whole
  * decision is made under the entry's exclusive lock, so it is exact: any
  * number of sessions on one bucket together get exactly its capacity.
+ *
+ * A bucket is never more than one period ahead of now: one that is (because
+ * the period was made shorter, or the clock went backwards) is pulled back
+ * and stored that way. Otherwise it would stay shut for as long as the old
+ * state or the clock step was.
  * ---------------------------------------------------------------------
  */
 
@@ -1940,7 +1945,11 @@ kv_muldiv(int64 a, int64 b, int64 c)
 #endif
 }
 
-/* How many microseconds an interval is, counted forward from now. */
+/*
+ * How many microseconds an interval is, counted forward from now. '-infinity'
+ * comes back as -1, which the caller rejects like any other non-positive
+ * period, and 'infinity' as the largest value, which the caller clamps.
+ */
 static int64
 kv_interval_micros(Datum interval)
 {
@@ -1950,6 +1959,10 @@ kv_interval_micros(Datum interval)
     at = DatumGetTimestampTz(DirectFunctionCall2(timestamptz_pl_interval,
                                                  TimestampTzGetDatum(now),
                                                  interval));
+    if (TIMESTAMP_IS_NOBEGIN(at))
+        return -1;
+    if (TIMESTAMP_IS_NOEND(at))
+        return PG_INT64_MAX;
     return at - now;
 }
 
@@ -1964,6 +1977,7 @@ kv_rate_limit_core(const KVKey *key, int64 capacity, int64 period, int64 cost,
     int64       base;
     int64       new_tat;
     int64       delay;
+    bool        pulled_back;
 
     e = kv_find(key, true);
     if (e != NULL)
@@ -2008,6 +2022,9 @@ kv_rate_limit_core(const KVKey *key, int64 capacity, int64 period, int64 cost,
 
     memcpy(&tat, kv_entry_value(e), sizeof(tat));
     base = Max(tat, (int64) now);
+    pulled_back = base > (int64) now + period;
+    if (pulled_back)
+        base = (int64) now + period;
     new_tat = base + inc;               /* can't overflow: see the clamp on period */
     delay = new_tat - now;
 
@@ -2026,6 +2043,12 @@ kv_rate_limit_core(const KVKey *key, int64 capacity, int64 period, int64 cost,
         out->remaining = kv_muldiv(Max(period - (base - now), 0), capacity, period);
         out->retry_after = delay - period;
         out->reset_after = base - now;
+        if (pulled_back)
+        {
+            /* store it, or every later call would be pulled back from the same place */
+            memcpy(kv_entry_value(e), &base, sizeof(base));
+            e->expires_at = base;
+        }
     }
     kv_touch(e, now);
     dshash_release_lock(kv_hash, e);
@@ -2065,6 +2088,16 @@ kv_rate_limit_args(FunctionCallInfo fcinfo, KVLimit *out)
      * it is as good as forever for a limiter.
      */
     period = Min(period, PG_INT64_MAX / 4);
+
+    /*
+     * The limiter counts in microseconds, and a request of cost 1 moves it
+     * forward by period / capacity of them, rounded down. Below one
+     * microsecond that is nothing, and the limiter would never refuse.
+     */
+    if (capacity > period)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("memkv rate limit capacity is more than one request per microsecond")));
     kv_rate_limit_core(&key, capacity, period, cost, out);
 }
 

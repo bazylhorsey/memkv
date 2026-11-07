@@ -49,6 +49,8 @@ BEGIN
     ASSERT pg_temp.state($q$SELECT memkv.rate_limit('x', 5, interval '0 seconds')$q$) = '22023', 'period 0';
     ASSERT pg_temp.state($q$SELECT memkv.rate_limit('x', 5, interval '1 hour', 0)$q$) = '22023', 'cost 0';
     ASSERT pg_temp.state($q$SELECT memkv.rate_limit('x', 5, interval '1 hour', 6)$q$) = '22023', 'cost over capacity';
+    ASSERT pg_temp.state($q$SELECT memkv.rate_limit('x', 5, interval '-infinity')$q$) = '22023', 'a period of minus infinity';
+    ASSERT pg_temp.state($q$SELECT memkv.rate_limit('x', 2000000, interval '1 second')$q$) = '22023', 'more than one request per microsecond';
 
     -- 22P02 invalid_text_representation: the value is not an integer
     ASSERT pg_temp.state($q$SELECT memkv.incr('s')$q$) = '22P02', 'incr on text';

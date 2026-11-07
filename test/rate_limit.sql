@@ -92,6 +92,21 @@ BEGIN
     ASSERT memkv.rate_limit('t:full', 2, interval '1 hour') AND memkv.rate_limit('t:full', 2, interval '1 hour');
     ASSERT NOT memkv.rate_limit('t:full', 4, interval '1 hour'), 'raising the capacity does not refill it';
 
+    -- a limiter is never more than one period ahead. Used up for an hour and
+    -- then asked about with a period of a second, it is a second ahead at most,
+    -- and that is kept: it opens again as the second passes, instead of being
+    -- pulled back to the same place on every call and never opening
+    FOR i IN 1..5 LOOP
+        ASSERT memkv.rate_limit('t:shrink', 5, interval '1 hour'), 'filling the hour';
+    END LOOP;
+    ASSERT NOT memkv.rate_limit('t:shrink', 5, interval '1 hour'), 'the hour is used up';
+    SELECT * INTO r FROM memkv.rate_limit_info('t:shrink', 5, interval '1 second');
+    ASSERT NOT r.allowed AND r.retry_after_ms <= 250 AND r.reset_after_ms <= 1000,
+           format('after shortening the period: retry in %s ms, full in %s ms', r.retry_after_ms, r.reset_after_ms);
+    ASSERT memkv.ttl('t:shrink') <= interval '1 second', 'and its TTL follows';
+    PERFORM pg_sleep(0.3);
+    ASSERT memkv.rate_limit('t:shrink', 5, interval '1 second'), 'it passes again within the period';
+
     -- bad arguments
     BEGIN PERFORM memkv.rate_limit('x', 0, interval '1 hour'); ASSERT false;
     EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
