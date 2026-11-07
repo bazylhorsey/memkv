@@ -69,7 +69,8 @@ static const struct config_enum_entry kv_eviction_options[] = {
 typedef enum KVType
 {
     KV_STRING = 0,
-    KV_HASH = 1
+    KV_HASH = 1,
+    KV_BUCKET = 2                   /* a rate limiter: one int64, see below */
 } KVType;
 
 /*
@@ -170,6 +171,9 @@ PG_FUNCTION_INFO_V1(kv_hgetall);
 PG_FUNCTION_INFO_V1(kv_sweep);
 PG_FUNCTION_INFO_V1(kv_flush);
 PG_FUNCTION_INFO_V1(kv_stats);
+PG_FUNCTION_INFO_V1(kv_rate_limit);
+PG_FUNCTION_INFO_V1(kv_rate_limit_info);
+PG_FUNCTION_INFO_V1(kv_verify);
 
 void
 _PG_init(void)
@@ -304,32 +308,35 @@ kv_wrongtype(void)
              errmsg("memkv key holds the wrong kind of value")));
 }
 
+/* The 128-bit hash of some key bytes, as the index has them. Needs the seed. */
+static void
+kv_hash_bytes(const char *data, Size len, KVHash *h)
+{
+    uint64      seed = kv_shared->hash_seed;
+
+    h->w[0] = hash_bytes_extended((const unsigned char *) data, (int) len, seed);
+    h->w[1] = hash_bytes_extended((const unsigned char *) data, (int) len,
+                                  seed ^ UINT64CONST(0x9e3779b97f4a7c15));
+#ifdef USE_ASSERT_CHECKING
+    if (kv_test_weak_hash)
+    {
+        h->w[0] &= 1;
+        h->w[1] = 0;
+    }
+#endif
+}
+
 /*
  * Make a KVKey from the bytes of t, which must stay alive as long as the key
  * is used. Attaches to the store first, because the hash needs its seed.
- * Two seeded 64-bit hashes make the 128 bits.
  */
 static void
 kv_key(text *t, KVKey *k)
 {
-    uint64      seed;
-
     kv_attach();
-    seed = kv_shared->hash_seed;
     k->data = VARDATA_ANY(t);
     k->len = VARSIZE_ANY_EXHDR(t);
-    k->hash.w[0] = hash_bytes_extended((const unsigned char *) k->data,
-                                       (int) k->len, seed);
-    k->hash.w[1] = hash_bytes_extended((const unsigned char *) k->data,
-                                       (int) k->len,
-                                       seed ^ UINT64CONST(0x9e3779b97f4a7c15));
-#ifdef USE_ASSERT_CHECKING
-    if (kv_test_weak_hash)
-    {
-        k->hash.w[0] &= 1;
-        k->hash.w[1] = 0;
-    }
-#endif
+    kv_hash_bytes(k->data, k->len, &k->hash);
 }
 
 /* Where an entry's key bytes are; its value follows them. */
@@ -1713,6 +1720,387 @@ kv_stats(PG_FUNCTION_ARGS)
     PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
+/* ---------------------------------------------------------------------
+ * Rate limiting
+ *
+ * A limiter is one int64 per key: the "theoretical arrival time" of GCRA, in
+ * microseconds. A request of cost n pushes it forward by n/capacity of the
+ * period, and is allowed if that leaves it no more than one period ahead of
+ * now. An absent bucket is a full one, and a bucket's TTL is the moment it
+ * would be full again, so idle buckets expire by themselves. The whole
+ * decision is made under the entry's exclusive lock, so it is exact: any
+ * number of sessions on one bucket together get exactly its capacity.
+ * ---------------------------------------------------------------------
+ */
+
+typedef struct KVLimit
+{
+    bool        allowed;
+    int64       remaining;          /* requests of cost 1 still allowed now */
+    int64       retry_after;        /* microseconds until this one would pass */
+    int64       reset_after;        /* microseconds until the bucket is full */
+} KVLimit;
+
+/* a * b / c, rounded down, without overflowing 64 bits on the way */
+static int64
+kv_muldiv(int64 a, int64 b, int64 c)
+{
+#ifdef HAVE_INT128
+    return (int64) (((int128) a * b) / c);
+#else
+    return (int64) ((double) a * (double) b / (double) c);
+#endif
+}
+
+/* How many microseconds an interval is, counted forward from now. */
+static int64
+kv_interval_micros(Datum interval)
+{
+    TimestampTz now = GetCurrentTimestamp();
+    TimestampTz at;
+
+    at = DatumGetTimestampTz(DirectFunctionCall2(timestamptz_pl_interval,
+                                                 TimestampTzGetDatum(now),
+                                                 interval));
+    return at - now;
+}
+
+static void
+kv_rate_limit_core(const KVKey *key, int64 capacity, int64 period, int64 cost,
+                   KVLimit *out)
+{
+    int64       inc = kv_muldiv(cost, period, capacity);
+    KVEntry    *e;
+    TimestampTz now;
+    int64       tat;
+    int64       base;
+    int64       new_tat;
+    int64       delay;
+
+    e = kv_find(key, true);
+    if (e != NULL)
+    {
+        now = GetCurrentTimestamp();
+        if (kv_expired(e, now))
+        {
+            dshash_release_lock(kv_hash, e);
+            e = NULL;
+        }
+    }
+    if (e == NULL)
+    {
+        /* A new bucket. Its allocation can't be made while we hold the entry. */
+        dsa_pointer newval = kv_alloc_blob(key, sizeof(int64));
+        bool        found;
+
+        e = kv_insert(key, newval, &found);
+        now = GetCurrentTimestamp();
+        if (found && !kv_expired(e, now))
+        {
+            /* someone else made it while we allocated: use theirs */
+            dsa_free(kv_dsa, newval);
+        }
+        else
+        {
+            dsa_pointer oldval = kv_store(e, found, newval, key, sizeof(int64),
+                                          KV_BUCKET, now);
+
+            tat = 0;                    /* long ago, so the bucket is full */
+            memcpy(kv_entry_value(e), &tat, sizeof(tat));
+            e->expires_at = now;        /* provisional, set below */
+            if (DsaPointerIsValid(oldval))
+                dsa_free(kv_dsa, oldval);
+        }
+    }
+    if (e->type != KV_BUCKET)
+    {
+        dshash_release_lock(kv_hash, e);
+        kv_wrongtype();
+    }
+
+    memcpy(&tat, kv_entry_value(e), sizeof(tat));
+    base = Max(tat, (int64) now);
+    new_tat = base + inc;               /* can't overflow: see the clamp on period */
+    delay = new_tat - now;
+
+    if (delay <= period)
+    {
+        out->allowed = true;
+        memcpy(kv_entry_value(e), &new_tat, sizeof(new_tat));
+        e->expires_at = new_tat;        /* full again at that moment */
+        out->remaining = kv_muldiv(period - delay, capacity, period);
+        out->retry_after = 0;
+        out->reset_after = delay;
+    }
+    else
+    {
+        out->allowed = false;
+        out->remaining = kv_muldiv(Max(period - (base - now), 0), capacity, period);
+        out->retry_after = delay - period;
+        out->reset_after = base - now;
+    }
+    kv_touch(e, now);
+    dshash_release_lock(kv_hash, e);
+}
+
+/* The arguments of rate_limit() and rate_limit_info() are the same. */
+static void
+kv_rate_limit_args(FunctionCallInfo fcinfo, KVLimit *out)
+{
+    KVKey       key;
+    int64       capacity = PG_GETARG_INT64(1);
+    int64       cost = PG_GETARG_INT64(3);
+    int64       period;
+
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
+    period = kv_interval_micros(PG_GETARG_DATUM(2));
+    if (capacity < 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("memkv rate limit capacity must be positive")));
+    if (period < 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("memkv rate limit period must be positive")));
+    if (cost < 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("memkv rate limit cost must be positive")));
+    if (cost > capacity)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("memkv rate limit cost is larger than the capacity, so it can never be allowed")));
+
+    /*
+     * An endless period is clamped to about 73,000 years. That keeps every
+     * time we add to it, including the stored one, far from overflowing, and
+     * it is as good as forever for a limiter.
+     */
+    period = Min(period, PG_INT64_MAX / 4);
+    kv_rate_limit_core(&key, capacity, period, cost, out);
+}
+
+/* rate_limit(key, capacity, period, cost DEFAULT 1) -> allowed */
+Datum
+kv_rate_limit(PG_FUNCTION_ARGS)
+{
+    KVLimit     r;
+
+    kv_rate_limit_args(fcinfo, &r);
+    PG_RETURN_BOOL(r.allowed);
+}
+
+/* microseconds to milliseconds, rounded up */
+static int64
+kv_ceil_ms(int64 us)
+{
+    return us / 1000 + (us % 1000 != 0);
+}
+
+/*
+ * rate_limit_info(key, capacity, period, cost DEFAULT 1)
+ *   -> allowed, remaining, retry_after_ms, reset_after_ms
+ */
+Datum
+kv_rate_limit_info(PG_FUNCTION_ARGS)
+{
+    TupleDesc   tupdesc;
+    Datum       values[4];
+    bool        nulls[4] = {false, false, false, false};
+    KVLimit     r;
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        elog(ERROR, "return type must be a row type");
+    kv_rate_limit_args(fcinfo, &r);
+
+    values[0] = BoolGetDatum(r.allowed);
+    values[1] = Int64GetDatum(r.remaining);
+    values[2] = Int64GetDatum(kv_ceil_ms(r.retry_after));
+    values[3] = Int64GetDatum(kv_ceil_ms(r.reset_after));
+    tupdesc = BlessTupleDesc(tupdesc);
+    PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/* ---------------------------------------------------------------------
+ * Self-check
+ *
+ * verify() walks the whole store and returns one row per inconsistency. It
+ * compares entries with each other (shared allocations, repeated versions), so
+ * it only means something while nothing else is writing: an entry freed and
+ * reallocated mid-scan would look like a duplicate. Run it after a workload.
+ * ---------------------------------------------------------------------
+ */
+
+static void kv_verify_report(ReturnSetInfo *rsinfo, const char *key,
+                             const char *fmt,...)
+            pg_attribute_printf(3, 4);
+
+/* One row: the key (null when the problem isn't about one entry) and what is wrong. */
+static void
+kv_verify_report(ReturnSetInfo *rsinfo, const char *key, const char *fmt,...)
+{
+    char        buf[256];
+    va_list     ap;
+    Datum       values[2];
+    bool        nulls[2];
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    nulls[0] = (key == NULL);
+    values[0] = key ? PointerGetDatum(cstring_to_text(key)) : (Datum) 0;
+    nulls[1] = false;
+    values[1] = PointerGetDatum(cstring_to_text(buf));
+    tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+static int
+kv_u64_cmp(const void *a, const void *b)
+{
+    uint64      x = *(const uint64 *) a;
+    uint64      y = *(const uint64 *) b;
+
+    return (x > y) - (x < y);
+}
+
+/* Up to 32 bytes of an entry's key, for messages. */
+static char *
+kv_key_label(const KVEntry *e)
+{
+    Size        n = Min(e->klen, 32);
+    const char *k = kv_entry_base(e);
+    char       *s = palloc(n + 4);
+    Size        i;
+
+    for (i = 0; i < n; i++)
+        s[i] = (k[i] >= 0x20 && k[i] < 0x7f) ? k[i] : '?';
+    if (e->klen > n)
+    {
+        s[n++] = '.';
+        s[n++] = '.';
+        s[n++] = '.';
+    }
+    s[n] = '\0';
+    return s;
+}
+
+/* Does a hash's blob parse exactly, with the number of fields it states? */
+static bool
+kv_h_wellformed(const char *b, Size len)
+{
+    uint32      n = kv_h_count(b, len);
+    Size        pos = KV_H_HDR;
+    uint32      seen = 0;
+
+    if (len < KV_H_HDR || n == 0)
+        return false;
+    while (pos < len)
+    {
+        KVHField    h;
+
+        if (len - pos < sizeof(h))
+            return false;
+        memcpy(&h, b + pos, sizeof(h));
+        pos += sizeof(h);
+        if ((Size) h.flen + h.vlen > len - pos)
+            return false;
+        pos += (Size) h.flen + h.vlen;
+        seen++;
+    }
+    return seen == n;
+}
+
+/* verify() -> (key, problem), one row per problem and none when the store is sound */
+Datum
+kv_verify(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    dshash_seq_status status;
+    KVEntry    *e;
+    uint64     *ptrs = NULL;
+    uint64     *vers = NULL;
+    int64       n = 0;
+    int64       cap = 0;
+    int64       i;
+
+    InitMaterializedSRF(fcinfo, 0);
+    kv_attach();
+
+    dshash_seq_init(&status, kv_hash, false);
+    while ((e = dshash_seq_next(&status)) != NULL)
+    {
+        KVHash      h;
+        char       *label;
+
+        if (e->type != KV_STRING && e->type != KV_HASH && e->type != KV_BUCKET)
+        {
+            kv_verify_report(rsinfo, NULL, "an entry has an unknown type %d", (int) e->type);
+            continue;
+        }
+        if (!DsaPointerIsValid(e->data) || e->klen > MaxAllocSize ||
+            e->len > MaxAllocSize)
+        {
+            kv_verify_report(rsinfo, NULL, "an entry has an invalid pointer or length");
+            continue;
+        }
+
+        label = kv_key_label(e);
+        kv_hash_bytes(kv_entry_base(e), e->klen, &h);
+        if (memcmp(&h, &e->hash, sizeof(h)) != 0)
+        {
+            kv_verify_report(rsinfo, label, "the key bytes don't match the entry's hash");
+        }
+        if (e->expires_at <= 0)
+        {
+            kv_verify_report(rsinfo, label, "the expiry time is not valid");
+        }
+        if (e->version == 0)
+        {
+            kv_verify_report(rsinfo, label, "the entry has no version");
+        }
+        if (e->type == KV_BUCKET && e->len != sizeof(int64))
+        {
+            kv_verify_report(rsinfo, label, "a rate limiter is %zu bytes, not 8", (size_t) e->len);
+        }
+        if (e->type == KV_HASH && !kv_h_wellformed(kv_entry_value(e), e->len))
+        {
+            kv_verify_report(rsinfo, label, "the hash does not parse");
+        }
+        pfree(label);
+
+        if (n == cap)
+        {
+            cap = cap == 0 ? 1024 : cap * 2;
+            ptrs = ptrs ? repalloc(ptrs, sizeof(uint64) * cap) : palloc(sizeof(uint64) * cap);
+            vers = vers ? repalloc(vers, sizeof(uint64) * cap) : palloc(sizeof(uint64) * cap);
+        }
+        ptrs[n] = (uint64) e->data;
+        vers[n] = e->version;
+        n++;
+    }
+    dshash_seq_term(&status);
+
+    if (n > 1)
+    {
+        qsort(ptrs, n, sizeof(uint64), kv_u64_cmp);
+        qsort(vers, n, sizeof(uint64), kv_u64_cmp);
+        for (i = 1; i < n; i++)
+        {
+            if (ptrs[i] == ptrs[i - 1] && (i == 1 || ptrs[i] != ptrs[i - 2]))
+            {
+                kv_verify_report(rsinfo, NULL, "two entries share one allocation (%llu)",
+                                 (unsigned long long) ptrs[i]);
+                }
+            if (vers[i] == vers[i - 1] && (i == 1 || vers[i] != vers[i - 2]))
+            {
+                kv_verify_report(rsinfo, NULL, "two entries have the version %llu",
+                                 (unsigned long long) vers[i]);
+                }
+        }
+    }
+    return (Datum) 0;
+}
+
 #ifdef USE_ASSERT_CHECKING
 /*
  * Test hook, assertion builds only, not part of the extension script: the
@@ -1731,6 +2119,50 @@ kv_debug_dsa(PG_FUNCTION_ARGS)
                  errmsg("must be superuser to dump the memkv allocator")));
     kv_attach();
     dsa_dump(kv_dsa);
+    PG_RETURN_VOID();
+}
+
+/*
+ * Test hook, assertion builds only: damage one entry on purpose, so a test can
+ * check that verify() notices. what is one of: hash (the key no longer matches
+ * its hash), type (an unknown kind), len (a hash or limiter of the wrong size),
+ * klen (the key length is off by one). The store should be flushed afterwards.
+ */
+PG_FUNCTION_INFO_V1(kv_debug_corrupt);
+
+Datum
+kv_debug_corrupt(PG_FUNCTION_ARGS)
+{
+    KVKey       key;
+    char       *what = text_to_cstring(PG_GETARG_TEXT_PP(1));
+    KVEntry    *e;
+
+    if (!superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("must be superuser to damage the memkv store")));
+    kv_key(PG_GETARG_TEXT_PP(0), &key);
+    e = kv_find(&key, true);
+    if (e == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_NO_DATA_FOUND),
+                 errmsg("no such key")));
+    if (strcmp(what, "hash") == 0)
+        e->hash.w[0] ^= 1;
+    else if (strcmp(what, "type") == 0)
+        e->type = 99;
+    else if (strcmp(what, "len") == 0)
+        e->len -= 1;
+    else if (strcmp(what, "klen") == 0)
+        e->klen += 1;
+    else
+    {
+        dshash_release_lock(kv_hash, e);
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("unknown kind of damage \"%s\"", what)));
+    }
+    dshash_release_lock(kv_hash, e);
     PG_RETURN_VOID();
 }
 #endif

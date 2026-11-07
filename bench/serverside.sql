@@ -25,7 +25,7 @@ BEGIN
     RAISE NOTICE 'empty loop (key text only): % ns/iteration', round(base);
 
     t0 := clock_timestamp();
-    FOR i IN 1..n LOOP x := kv_get('k' || (1 + i % 100000)); END LOOP;
+    FOR i IN 1..n LOOP x := memkv.get('k' || (1 + i % 100000)); END LOOP;
     r := extract(epoch FROM clock_timestamp() - t0) * 1e9 / n - base;
     RAISE NOTICE 'get   memkv : % ns/op', round(r);
 
@@ -35,7 +35,7 @@ BEGIN
     RAISE NOTICE 'get   table : % ns/op', round(r);
 
     t0 := clock_timestamp();
-    FOR i IN 1..n LOOP y := kv_incr('c' || (1 + i % 100000)); END LOOP;
+    FOR i IN 1..n LOOP y := memkv.incr('c' || (1 + i % 100000)); END LOOP;
     r := extract(epoch FROM clock_timestamp() - t0) * 1e9 / n - base;
     RAISE NOTICE 'incr  memkv : % ns/op', round(r);
 
@@ -48,7 +48,7 @@ BEGIN
     RAISE NOTICE 'incr  table : % ns/op', round(r);
 
     t0 := clock_timestamp();
-    FOR i IN 1..n LOOP PERFORM kv_set('k' || (1 + i % 100000), 'value'); END LOOP;
+    FOR i IN 1..n LOOP PERFORM memkv.set('k' || (1 + i % 100000), 'value'); END LOOP;
     r := extract(epoch FROM clock_timestamp() - t0) * 1e9 / n - base;
     RAISE NOTICE 'set   memkv : % ns/op', round(r);
 
