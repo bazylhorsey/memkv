@@ -35,8 +35,10 @@ psql -X -q -c "CREATE EXTENSION memkv" || exit 1
 
 fail=0
 cd "$SRC"
-for t in commands keys overwrite rate_limit errors access verify collision eviction; do
-    if out=$(psql -X -v ON_ERROR_STOP=1 -f "test/$t.sql" 2>&1 >/dev/null); then
+# a test that hangs (a write that can't be cancelled, say) should fail, not stall the job
+if command -v timeout >/dev/null; then limit="timeout 300"; else limit=""; fi
+for t in commands keys overwrite rate_limit errors access verify collision eviction volatile reclaim; do
+    if out=$($limit psql -X -v ON_ERROR_STOP=1 -f "test/$t.sql" 2>&1 >/dev/null); then
         echo "PASS  test/$t.sql"
     else
         echo "FAIL  test/$t.sql"
@@ -46,7 +48,7 @@ for t in commands keys overwrite rate_limit errors access verify collision evict
 done
 
 # the assertion-only tests must have run, not skipped themselves
-for marker in "collision.sql:memkv.test_weak_hash" "verify.sql:kv_debug_corrupt"; do
+for marker in "collision.sql:memkv.test_weak_hash" "verify.sql:kv_debug_corrupt" "reclaim.sql:memkv.test_reclaim"; do
     f=${marker%%:*}
     if psql -X -v ON_ERROR_STOP=1 -f "test/$f" 2>&1 | grep -q "skipped"; then
         echo "FAIL  test/$f skipped itself on an assertion build"

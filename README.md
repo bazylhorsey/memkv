@@ -123,14 +123,19 @@ Both are `SIGHUP` settings: change them with `ALTER SYSTEM` and `SELECT pg_reloa
 When a write can't get memory, memkv first drops every expired key and retries. If that isn't enough, it
 evicts the least recently used keys allowed by the policy and retries again, repeating until the write fits
 or nothing evictable is left (then it errors with `memkv is full`). One backend evicts at a time; the others
-wait and retry their allocation first, since the evictor may have freed what they need.
+wait and retry their allocation first, since the evictor may have freed what they need. The lock is let go
+between rounds, so a write that is stuck evicting can be cancelled, for example by `statement_timeout`.
 
 - A key's "last used" time is updated by `get`, `set`, `incr` and `expire`.
-- Each eviction round scans the index once and evicts the oldest ~1/16 of live keys (at least 1, at most
-  262,144), doubling each further round within the same write. The scan takes time in proportion to the number
-  of keys and everyone who needs memory waits for it, so evicting a share of the store at once, not a fixed
-  handful, is what keeps a store with millions of keys from scanning constantly. It does mean a full store
-  usually sits a few percent below the cap right after a round.
+- Each eviction round scans the index once and evicts the oldest ~1/16 of the keys the policy lets it evict (at
+  least 1, at most 262,144). Each further round within the same write evicts twice as many, as far as the
+  candidate pool allows; the pool holds about a sixteenth of the store (at least 4,096 keys), so in a large
+  store every round is about that share. The scan takes time in proportion to the number of keys and everyone
+  who needs memory waits for it, so evicting a share of the store at once, not a fixed handful, is what keeps a
+  store with millions of keys from scanning constantly. It does mean a full store usually sits a few percent
+  below the cap right after a round.
+- Dropping expired keys comes first, but only in the first round of a write: if it is still short, later rounds
+  evict live keys even when more keys expired in the meantime.
 - The scan costs about 70 ns per key: roughly 80 ms for a million keys in a 4-CPU container. Writes that are
   waiting for memory wait that long; reads and in-place updates carry on, apart from short waits on the part of
   the index being scanned. A store that is always full and always being written to spends that time every second
@@ -192,14 +197,14 @@ SELECT count(*) FROM memkv.verify();    -- 0
 Run these against a scratch server. Each prints nothing and exits 0 when it passes:
 
 ```sh
-for t in keys overwrite rate_limit errors access verify; do psql -X -v ON_ERROR_STOP=1 -f test/$t.sql; done
+for t in keys overwrite rate_limit errors access verify volatile; do psql -X -v ON_ERROR_STOP=1 -f test/$t.sql; done
 psql -X -v ON_ERROR_STOP=1 -f test/eviction.sql     # shrinks memkv.max_memory to 1MB while it runs
 test/stress/run.sh 30 32                            # 32 clients; set MEMKV_TEST_LOG=<server log> on assertion builds
 ```
 
 `test/commands.sql` is a walk-through of every function with the expected results in its comments.
-`test/collision.sql`, and the damage detection in `test/verify.sql`, need a server built with assertions and
-skip themselves otherwise. `test/stress/run.sh` has two kinds of leak check: on an assertion build it reads
+`test/collision.sql`, `test/reclaim.sql`, and the damage detection in `test/verify.sql`, need a server built
+with assertions and skip themselves otherwise. `test/stress/run.sh` has two kinds of leak check: on an assertion build it reads
 PostgreSQL's allocator dump and requires that a flush leaves only the index's own structures allocated.
 
 To run everything without setting anything up:

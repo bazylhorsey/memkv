@@ -31,8 +31,10 @@ psql() { docker exec -e PGUSER=postgres "$NAME" psql -X -v ON_ERROR_STOP=1 "$@";
 psql -q -c "CREATE EXTENSION memkv" || exit 1
 
 fail=0
-for t in commands keys overwrite rate_limit errors access verify collision eviction; do
-    if out=$(psql -f "/test/$t.sql" 2>&1 >/dev/null); then
+# a test that hangs (a write that can't be cancelled, say) should fail, not stall the job
+if command -v timeout >/dev/null; then limit="timeout 300"; else limit=""; fi
+for t in commands keys overwrite rate_limit errors access verify collision eviction volatile reclaim; do
+    if out=$($limit docker exec -e PGUSER=postgres "$NAME" psql -X -v ON_ERROR_STOP=1 -f "/test/$t.sql" 2>&1 >/dev/null); then
         echo "PASS  test/$t.sql"
     else
         echo "FAIL  test/$t.sql"

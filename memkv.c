@@ -44,9 +44,10 @@ PG_MODULE_MAGIC;
 
 /*
  * Eviction tuning. Each eviction round scans the whole index once and
- * evicts about 1/16 of the live keys (at least one), oldest first. Later
- * rounds within the same allocation double that, so a large value that
- * needs many small ones gone doesn't take hundreds of scans.
+ * evicts about 1/16 of the keys the policy allows it to evict (at least
+ * one), oldest first. Later rounds within the same allocation double that, as
+ * far as the candidate pool allows, so a large value that needs many small
+ * ones gone doesn't take hundreds of scans.
  *
  * The scan costs time in proportion to the number of keys, and everyone who
  * needs memory waits for it, so evicting a fixed handful per scan would make a
@@ -160,6 +161,7 @@ static int  kv_eviction_policy = KV_EVICT_ALLKEYS_LRU;
 static int  kv_applied_mb = -1;
 #ifdef USE_ASSERT_CHECKING
 static bool kv_test_weak_hash = false;  /* test only: see _PG_init */
+static int  kv_test_reclaim = 0;        /* test only: see _PG_init */
 #endif
 
 PG_FUNCTION_INFO_V1(kv_set);
@@ -214,6 +216,18 @@ _PG_init(void)
                              NULL, &kv_test_weak_hash, false,
                              PGC_SIGHUP, GUC_NOT_IN_SAMPLE,
                              NULL, NULL, NULL);
+
+    /*
+     * Make every eviction round behave as if keys kept expiring while it ran:
+     * 1 pretends one key was dropped, 2 pretends the same and then frees
+     * nothing at all, so a write that needs memory loops until it is
+     * cancelled. For testing that such a loop ends or can be interrupted.
+     */
+    DefineCustomIntVariable("memkv.test_reclaim",
+                            "Test only: make eviction rounds see phantom expiry.",
+                            NULL, &kv_test_reclaim, 0, 0, 2,
+                            PGC_USERSET, GUC_NOT_IN_SAMPLE,
+                            NULL, NULL, NULL);
 #endif
     MarkGUCPrefixReserved("memkv");
 }
@@ -496,10 +510,14 @@ kv_candidate_cmp(const void *a, const void *b)
 
 /*
  * One eviction round. Scans the index once, dropping expired keys as it
- * goes and collecting the least recently used eligible live keys. If any
- * expired keys were dropped, returns without evicting live ones so the
- * caller can retry its allocation first. Otherwise evicts the oldest
- * candidates, skipping any that were touched since the scan.
+ * goes and collecting the least recently used eligible live keys. In the
+ * first round of an allocation, if any expired keys were dropped it returns
+ * without evicting live ones, so the caller can retry its allocation first.
+ * Later rounds evict regardless: keys that expire while a round runs would
+ * otherwise put off evicting a live key for as long as they kept expiring,
+ * and a write that needs more than scattered small chunks (a large value, a
+ * bigger index) would never get its memory. Evicts the oldest candidates,
+ * skipping any that were touched since the scan.
  *
  * Returns how many keys were removed; *ncand is how many live keys were
  * eligible for eviction. Must be called without holding any dshash lock.
@@ -510,7 +528,7 @@ kv_evict_round(KVCandidate *pool, int pool_cap, int round, int *ncand)
     dshash_seq_status status;
     KVEntry    *e;
     TimestampTz now = GetCurrentTimestamp();
-    int64       nlive = 0;
+    int64       neligible = 0;
     int64       expired = 0;
     int64       evicted = 0;
     int64       want;
@@ -527,21 +545,28 @@ kv_evict_round(KVCandidate *pool, int pool_cap, int round, int *ncand)
             expired++;
             continue;
         }
-        nlive++;
         if (kv_eviction_policy == KV_EVICT_VOLATILE_LRU &&
             e->expires_at == KV_NEVER)
             continue;
+        neligible++;
         kv_pool_offer(pool, &npool, pool_cap, e, kv_atime(e));
     }
     dshash_seq_term(&status);
     kv_count(&kv_shared->expired, expired);
-    pg_atomic_write_u64(&kv_shared->evict_hint, (uint64) nlive);
+    pg_atomic_write_u64(&kv_shared->evict_hint, (uint64) neligible);
+
+#ifdef USE_ASSERT_CHECKING
+    if (kv_test_reclaim == 2)
+        return 1;                       /* claim progress, free nothing */
+    if (kv_test_reclaim == 1)
+        expired++;                      /* a key "expired" while we scanned */
+#endif
 
     *ncand = npool;
-    if (expired > 0 || npool == 0)
+    if ((expired > 0 && round == 0) || npool == 0)
         return expired;
 
-    want = Max(nlive >> KV_EVICT_SHIFT, 1) << Min(round, 12);
+    want = Max(neligible >> KV_EVICT_SHIFT, 1) << Min(round, 12);
     want = Min(want, npool);
     qsort(pool, npool, sizeof(KVCandidate), kv_candidate_cmp);
 
@@ -564,7 +589,7 @@ kv_evict_round(KVCandidate *pool, int pool_cap, int round, int *ncand)
         evicted++;
     }
     kv_count(&kv_shared->evicted, evicted);
-    return evicted;
+    return expired + evicted;
 }
 
 /* State for a loop that frees memory until an allocation fits. */
@@ -591,15 +616,15 @@ kv_full_error(void)
 /*
  * Free some memory: drop expired keys, then evict as the policy allows.
  * Returns false when there is nothing more to free. Never call while holding
- * a dshash lock: this takes them.
+ * a dshash lock: this takes them. The caller holds reclaim_lock, so this can't
+ * check for interrupts (holding an LWLock defers them): the caller does that
+ * between rounds, with the lock released.
  */
 static bool
 kv_reclaim(KVReclaim *rc)
 {
     int64       freed;
     int         ncand;
-
-    CHECK_FOR_INTERRUPTS();
 
     if (kv_eviction_policy == KV_EVICT_NONE)
     {
@@ -632,6 +657,28 @@ kv_reclaim_done(KVReclaim *rc)
 }
 
 /*
+ * Check for interrupts between rounds of reclaiming, with reclaim_lock
+ * released: a cancel, a statement timeout or a shutdown has to be able to end
+ * a write that is stuck evicting. held is an allocation the caller owns and
+ * hasn't attached to anything yet; an error here must not leak it.
+ */
+static void
+kv_reclaim_interrupts(dsa_pointer held)
+{
+    PG_TRY();
+    {
+        CHECK_FOR_INTERRUPTS();
+    }
+    PG_CATCH();
+    {
+        if (DsaPointerIsValid(held))
+            dsa_free(kv_dsa, held);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+}
+
+/*
  * Allocate space for a key and value. Never call while holding a dshash
  * lock: when the store is full this sweeps expired keys and evicts others,
  * which takes those locks.
@@ -660,15 +707,26 @@ kv_alloc(Size len)
          * give up and raise an error while the winner's memory sat free. So
          * whoever gets the lock first tries again, because someone else may
          * have freed what it needs while it waited, and only then evicts.
+         * One round per time holding the lock, so that between rounds this
+         * backend can be cancelled and others get their turn.
          */
-        LWLockAcquire(&kv_shared->reclaim_lock, LW_EXCLUSIVE);
         for (;;)
         {
+            bool        more;
+
+            LWLockAcquire(&kv_shared->reclaim_lock, LW_EXCLUSIVE);
             p = dsa_allocate_extended(kv_dsa, Max(len, 1), DSA_ALLOC_NO_OOM);
-            if (DsaPointerIsValid(p) || !kv_reclaim(&rc))
+            more = !DsaPointerIsValid(p) && kv_reclaim(&rc);
+            LWLockRelease(&kv_shared->reclaim_lock);
+
+            if (DsaPointerIsValid(p) || !more)
                 break;
+            /* the round just freed memory: try for it before queueing again */
+            p = dsa_allocate_extended(kv_dsa, Max(len, 1), DSA_ALLOC_NO_OOM);
+            if (DsaPointerIsValid(p))
+                break;
+            kv_reclaim_interrupts(InvalidDsaPointer);
         }
-        LWLockRelease(&kv_shared->reclaim_lock);
 
         kv_reclaim_done(&rc);
         if (!DsaPointerIsValid(p))
@@ -719,14 +777,24 @@ kv_insert(const KVKey *key, dsa_pointer newval, bool *found)
     if (e == NULL)
     {
         /* No room in the index: reclaim one backend at a time, as in kv_alloc. */
-        LWLockAcquire(&kv_shared->reclaim_lock, LW_EXCLUSIVE);
-        while ((e = dshash_find_or_insert_extended(kv_hash, &key->hash, found,
-                                                   DSHASH_INSERT_NO_OOM)) == NULL)
+        for (;;)
         {
-            if (!kv_reclaim(&rc))
+            bool        more;
+
+            LWLockAcquire(&kv_shared->reclaim_lock, LW_EXCLUSIVE);
+            e = dshash_find_or_insert_extended(kv_hash, &key->hash, found,
+                                               DSHASH_INSERT_NO_OOM);
+            more = e == NULL && kv_reclaim(&rc);
+            LWLockRelease(&kv_shared->reclaim_lock);
+
+            if (e != NULL || !more)
                 break;
+            e = dshash_find_or_insert_extended(kv_hash, &key->hash, found,
+                                               DSHASH_INSERT_NO_OOM);
+            if (e != NULL)
+                break;
+            kv_reclaim_interrupts(newval);
         }
-        LWLockRelease(&kv_shared->reclaim_lock);
 
         kv_reclaim_done(&rc);
         if (e == NULL)
