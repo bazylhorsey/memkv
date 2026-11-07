@@ -2243,9 +2243,11 @@ kv_verify(PG_FUNCTION_ARGS)
     int64       n = 0;
     int64       cap = 0;
     int64       i;
+    uint64      total;
 
     InitMaterializedSRF(fcinfo, 0);
     kv_attach();
+    total = dsa_get_total_size(kv_dsa);     /* no key or value is longer than the store */
 
     dshash_seq_init(&status, kv_hash, false);
     while ((e = dshash_seq_next(&status)) != NULL)
@@ -2258,8 +2260,8 @@ kv_verify(PG_FUNCTION_ARGS)
             kv_verify_report(rsinfo, NULL, "an entry has an unknown type %d", (int) e->type);
             continue;
         }
-        if (!DsaPointerIsValid(e->data) || e->klen > MaxAllocSize ||
-            e->len > MaxAllocSize || e->vcap > MaxAllocSize)
+        if (!DsaPointerIsValid(e->data) || e->klen > total ||
+            e->len > total || e->vcap > total)
         {
             kv_verify_report(rsinfo, NULL, "an entry has an invalid pointer or length");
             continue;
