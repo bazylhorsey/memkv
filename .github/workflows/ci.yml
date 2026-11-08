@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # What a user gets: the Dockerfile on the official PostgreSQL 19 image.
+  image:
+    name: tests on the official PG 19 image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ci/run.sh
+
+  # The tests that need assertions: hash collisions, damage detection in verify(),
+  # and the allocator-level leak check. The official image isn't built with them.
+  assertions:
+    name: tests on PG 19 built with assertions
+    runs-on: ubuntu-latest
+    env:
+      PG_VERSION: 19rc1
+      PG_SHA256: af105fc8e960fc836a09fc2cd7f582b49fd17675d9d36631abe3a565bfd7d701
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache the PostgreSQL build
+        id: pg
+        uses: actions/cache@v4
+        with:
+          path: ~/pg19
+          key: pg-${{ env.PG_VERSION }}-cassert-${{ runner.os }}-v1
+      - name: Build PostgreSQL ${{ env.PG_VERSION }} with assertions
+        if: steps.pg.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o pg.tar.bz2 "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2"
+          echo "${PG_SHA256}  pg.tar.bz2" | sha256sum -c -
+          tar xjf pg.tar.bz2
+          cd "postgresql-${PG_VERSION}"
+          ./configure --prefix="$HOME/pg19" --enable-cassert --enable-debug \
+            --without-icu --without-readline --without-zlib CFLAGS="-O1 -fno-omit-frame-pointer"
+          make -s -j"$(nproc)"
+          make -s install
+      - name: Build memkv and run every test
+        run: ci/assert.sh "$HOME/pg19"

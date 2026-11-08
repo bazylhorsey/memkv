@@ -1,4 +1,5 @@
-comment = 'In-memory key-value store with TTLs'
+comment = 'Valkey-style key-value store in shared memory: TTLs, LRU eviction, hashes, rate limiting'
 default_version = '0.1'
 module_pathname = '$libdir/memkv'
-relocatable = true
+relocatable = false
+schema = memkv
